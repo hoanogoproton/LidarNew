@@ -52,10 +52,10 @@ class LidarData:
         self.running = True  # Cờ điều khiển vòng lặp của các thread
 
         # Thông số tính khoảng cách từ encoder (đơn vị cm)
-        self.wheel_diameter = 7.0  # cm
-        self.ppr = 350  # pulses per revolution
+        self.wheel_diameter = 60  # mm
+        self.ppr = 200  # pulses per revolution
         self.pi = 3.1416
-        self.wheel_circumference = self.wheel_diameter * self.pi  # cm
+        self.wheel_circumference = self.wheel_diameter * self.pi  # mm
 
         # Các biến định vị (pose) của robot, lưu theo đơn vị mm
         self.pose_x = 0.0  # mm
@@ -65,11 +65,11 @@ class LidarData:
         # Các biến sai số cho bộ lọc (Kalman Filter placeholder)
         self.pose_x_error = 1.0
         self.pose_y_error = 1.0
-        self.pose_theta_error = 1.0
+        self.pose_theta_error = 2.5
 
         self.last_encoder_left = None
         self.last_encoder_right = None
-        self.wheel_base = 19.0  # cm
+        self.wheel_base = 50  # mm
 
         # Tạo figure cho matplotlib để hiển thị bản đồ
         self.fig, self.ax = plt.subplots()
@@ -79,6 +79,10 @@ class LidarData:
         # Thử kết nối ban đầu
         if not self._connect_wifi():
             logging.error("Kết nối ban đầu không thành công. Vui lòng nhập IP ESP32 thủ công qua giao diện.")
+        else:
+            # Gửi lệnh reset encoders sau khi kết nối thành công
+            self.send_command("RESET_ENCODERS")
+            logging.info("Đã gửi lệnh reset encoders")
 
         # Khởi tạo các thread xử lý lệnh và dữ liệu
         self.command_thread = threading.Thread(target=self._handle_commands, daemon=True)
@@ -190,7 +194,7 @@ class LidarData:
             return
 
         global_x_coords, global_y_coords = self._to_global_coordinates(angles, distances)
-        filtered_x, filtered_y = self._remove_outliers(global_x_coords, global_y_coords)  # Sử dụng hàm mới
+        filtered_x, filtered_y = self._remove_outliers(global_x_coords, global_y_coords)
 
         with self.data_lock:
             self.data['x_coords'].extend(filtered_x)
@@ -201,7 +205,18 @@ class LidarData:
         self.ax.clear()
         self.ax.imshow(grid, cmap='gray', origin='lower',
                        extent=(-self.MAX_DISTANCE, self.MAX_DISTANCE, -self.MAX_DISTANCE, self.MAX_DISTANCE))
+
+        # Vẽ vị trí của robot
         self.ax.plot(self.pose_x, self.pose_y, 'ro', markersize=10)
+
+        # Tính toán điểm kết thúc của đường thẳng biểu diễn hướng
+        arrow_length = 500  # Độ dài đường thẳng (mm), bạn có thể điều chỉnh
+        end_x = self.pose_x + arrow_length * np.cos(self.pose_theta)
+        end_y = self.pose_y + arrow_length * np.sin(self.pose_theta)
+
+        # Vẽ đường thẳng biểu diễn hướng
+        self.ax.plot([self.pose_x, end_x], [self.pose_y, end_y], 'r-', linewidth=2)
+
         self.ax.set_title(f"LiDAR Occupancy Grid Map - Distance: {self.robot_distance:.2f} mm")
         self.ax.grid(True)
         self.fig.canvas.draw()
@@ -230,7 +245,6 @@ class LidarData:
                     logging.warning("Connection closed by server.")
                     self.sock = None
                     continue
-                # Giải mã dữ liệu nhận được
                 data = data.decode('utf-8', errors='ignore')
                 buffer += data
             except BlockingIOError:
@@ -241,45 +255,54 @@ class LidarData:
                 self.sock = None
                 continue
 
-            # Xử lý từng dòng dữ liệu
             while '\n' in buffer:
                 line, buffer = buffer.split('\n', 1)
                 logging.debug("Raw data received: %s", line)
                 sensor_data = line.strip().split('\t')
-                # Kiểm tra số lượng token (dự kiến 9)
                 if len(sensor_data) != 9:
                     logging.warning("Sensor data length mismatch: %s", sensor_data)
                     continue
 
                 try:
-                    # Chuyển đổi các giá trị từ chuỗi sang số
                     base_angle = int(sensor_data[0])
                     speed = int(sensor_data[1])
-                    # Dùng NumPy để chuyển đổi danh sách string thành mảng float
                     distances = np.array(sensor_data[2:6], dtype=float)
                     encoder_count = int(sensor_data[7].strip())
                     encoder_count2 = int(sensor_data[8].strip())
+
+                    # Log giá trị encoder thô ngay khi nhận được
+                    logging.info("Raw encoder values: encoder_count=%d, encoder_count2=%d",
+                                 encoder_count, encoder_count2)
                 except ValueError as e:
                     logging.error("Error parsing sensor data %s: %s", sensor_data, e)
                     continue
 
                 # --- Xử lý odometry ---
                 if self.last_encoder_left is None:
+                    # Lần đọc đầu tiên: gán giá trị encoder ban đầu và reset robot_distance về 0
                     self.last_encoder_left = encoder_count
                     self.last_encoder_right = encoder_count2
+                    self.initial_encoder_left = encoder_count
+                    self.initial_encoder_right = encoder_count2
+                    self.robot_distance = 0.0
+                    logging.info("Initialized encoders: left=%d, right=%d",
+                                 encoder_count, encoder_count2)
                 else:
-                    delta_left = (encoder_count - self.last_encoder_left) * self.wheel_circumference / self.ppr  # cm
-                    delta_right = (encoder_count2 - self.last_encoder_right) * self.wheel_circumference / self.ppr  # cm
-                    delta_s = (delta_left + delta_right) / 2.0  # cm
+                    delta_left = (encoder_count - self.last_encoder_left) * self.wheel_circumference / self.ppr  # mm
+                    delta_right = (encoder_count2 - self.last_encoder_right) * self.wheel_circumference / self.ppr  # mm
+                    delta_s = (delta_left + delta_right) / 2.0  # mm
                     delta_theta = (delta_right - delta_left) / self.wheel_base  # radian
-                    delta_s_mm = delta_s * 10  # chuyển từ cm sang mm
+                    delta_s_mm = delta_s  # Đã tính bằng mm
 
-                    # Tính toán pose mới (chưa lọc)
+                    # Log giá trị trung gian
+                    logging.debug("Encoder: left=%d, right=%d, delta_left=%.2f mm, delta_right=%.2f mm",
+                                  encoder_count, encoder_count2, delta_left, delta_right)
+                    logging.debug("Odometry: delta_s=%.2f mm, delta_theta=%.4f rad", delta_s, delta_theta)
+
                     new_pose_x = self.pose_x + delta_s_mm * np.cos(self.pose_theta + delta_theta / 2)
                     new_pose_y = self.pose_y + delta_s_mm * np.sin(self.pose_theta + delta_theta / 2)
                     new_pose_theta = self.pose_theta + delta_theta
 
-                    # Áp dụng Kalman Filter để cập nhật pose (placeholder)
                     self.pose_x, self.pose_x_error = self.kalman_filter(
                         new_pose_x, self.pose_x, self.pose_x_error, process_variance=1e-3, measurement_variance=1e-2)
                     self.pose_y, self.pose_y_error = self.kalman_filter(
@@ -288,16 +311,25 @@ class LidarData:
                         new_pose_theta, self.pose_theta, self.pose_theta_error, process_variance=1e-3,
                         measurement_variance=1e-2)
 
+                    # Log pose sau khi cập nhật
+                    logging.info("Pose updated: x=%.2f mm, y=%.2f mm, theta=%.4f rad",
+                                 self.pose_x, self.pose_y, self.pose_theta)
+
+                    # Log giá trị encoder trước và sau khi cập nhật
+                    logging.debug("Encoder update: prev_left=%d, prev_right=%d, new_left=%d, new_right=%d",
+                                  self.last_encoder_left, self.last_encoder_right, encoder_count, encoder_count2)
+
                     self.last_encoder_left = encoder_count
                     self.last_encoder_right = encoder_count2
 
-                # Cập nhật tổng quãng đường (mm)
-                self.robot_distance = ((encoder_count + encoder_count2) / 2 * self.wheel_circumference / self.ppr) * 10
+                # Cập nhật tổng quãng đường di chuyển
+                self.robot_distance = (((encoder_count - self.initial_encoder_left) + (
+                        encoder_count2 - self.initial_encoder_right)) / 2
+                                       * self.wheel_circumference / self.ppr)
+                logging.info("Total distance traveled: %.2f mm", self.robot_distance)
 
                 # --- Xử lý dữ liệu LiDAR ---
-                # Tính các góc cho 4 tia LiDAR theo vector hoá (đổi sang radian)
                 angles = (np.arange(4) + base_angle) * (pi / 180)
-                # Lọc dữ liệu khoảng cách hợp lệ
                 valid_mask = (distances >= self.MIN_DISTANCE) & (distances <= self.MAX_DISTANCE)
                 valid_angles = angles[valid_mask]
                 valid_distances = distances[valid_mask]
@@ -309,7 +341,6 @@ class LidarData:
                     if len(self.data['angles']) >= self.MAX_DATA_SIZE:
                         self.data_queue.put(True)
                         self.data_event.set()
-                    # Cắt giảm dữ liệu nếu quá nhiều để tránh tràn bộ nhớ
                     if len(self.data['angles']) > 500:
                         indices = np.random.choice(len(self.data['angles']), 200, replace=False)
                         self.data['angles'] = [self.data['angles'][i] for i in indices]
@@ -368,7 +399,7 @@ class LidarData:
 
 
 if __name__ == "__main__":
-    lidar = LidarData(host='192.168.247.4', port=80, neighbor_radius=50, min_neighbors=5)
+    lidar = LidarData(host='192.168.100.148', port=80, neighbor_radius=50, min_neighbors=5)
     data_thread = threading.Thread(target=lidar.update_data, daemon=True)
     data_thread.start()
 

@@ -20,10 +20,10 @@ class LidarData:
     DATA_LENGTH = 7
     MAX_DISTANCE = 3000  # mm
     MIN_DISTANCE = 50  # mm
-    MAX_DATA_SIZE = 200  # Tích lũy nhiều điểm trước khi vẽ
+    MAX_DATA_SIZE = 180  # Tích lũy nhiều điểm trước khi vẽ
     NEIGHBOR_RADIUS = 48
     MIN_NEIGHBORS = 4
-    GRID_SIZE = 50  # mm
+    GRID_SIZE = 20  # mm
 
     def __init__(self, host='192.168.100.148', port=80, neighbor_radius=48, min_neighbors=4):
         self.host = host
@@ -399,7 +399,7 @@ class LidarData:
 
 
 if __name__ == "__main__":
-    lidar = LidarData(host='192.168.100.148', port=80, neighbor_radius=50, min_neighbors=5)
+    lidar = LidarData(host='192.168.247.4', port=80, neighbor_radius=50, min_neighbors=5)
     data_thread = threading.Thread(target=lidar.update_data, daemon=True)
     data_thread.start()
 

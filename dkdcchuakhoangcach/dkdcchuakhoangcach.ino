@@ -47,6 +47,8 @@ int motorDirection2 = 0;         // Hướng motor thứ hai (1: tiến, -1: lù
 const int encoderMin = -32768;
 const int encoderMax = 32767;
 
+const float speedx = 1.14;
+
 // Định nghĩa cho EEPROM
 #define EEPROM_SIZE 128
 #define SSID_ADDR 0
@@ -66,7 +68,7 @@ volatile bool newCommand = false;
 String pendingCommand = "";
 
 // PID parameters
-double kp = 2.0, ki = 0.3, kd = 0.3;
+double kp = 2.0, ki = 0, kd = 0;
 double proportionalTerm = 0;
 double derivativeTerm = 0; 
 double integralTerm = 0;
@@ -119,13 +121,6 @@ void writeEEPROM(const char* newSSID, const char* newPass) {
     EEPROM.commit();
 }
 
-// Trang HTML để cấu hình WiFi
-String htmlPage = "<!DOCTYPE html><html><body><h2>WiFi Config</h2>"
-                  "<form action=\"/save\" method=\"POST\">"
-                  "SSID: <input type=\"text\" name=\"ssid\"><br>"
-                  "Password: <input type=\"text\" name=\"pass\"><br>"
-                  "<input type=\"submit\" value=\"Save\"></form>"
-                  "</body></html>";
 
 // Kết nối WiFi
 bool connectWiFi() {
@@ -149,7 +144,14 @@ void startAPMode() {
 
 // Xử lý yêu cầu gốc cho WebServer
 void handleRoot() {
-    webServer.send(200, "text/html", htmlPage);
+    String page = "<!DOCTYPE html><html><body><h2>WiFi Config</h2>";
+    page += "<p>Current SSID: " + String(ssid) + "</p>";
+    page += "<form action=\"/save\" method=\"POST\">";
+    page += "New SSID: <input type=\"text\" name=\"ssid\"><br>";
+    page += "New Password: <input type=\"text\" name=\"pass\"><br>";
+    page += "<input type=\"submit\" value=\"Save\"></form>";
+    page += "</body></html>";
+    webServer.send(200, "text/html", page);
 }
 
 // Xử lý lưu WiFi mới
@@ -219,7 +221,6 @@ void loop() {
     if (!newCommand) {
         handleLidarData();
     }
-
     unsigned long currentTime = millis();
     if (currentTime - lastPIDTime >= 100) {
         motorSpeedPID(MOTOR_SPEED, data[1]);
@@ -248,7 +249,7 @@ void handleClientCommands() {
         Serial.println("Received command: " + command);
         newCommand = true;
         pendingCommand = command;
-        
+
         if (pendingCommand == "forward") {
             motorForwardBoth();
         } else if (pendingCommand == "reverse") {
@@ -259,6 +260,10 @@ void handleClientCommands() {
             motorTurnRight();
         } else if (pendingCommand == "stop") {
             motorStopBoth();
+        } else if (pendingCommand == "RESET_ENCODERS") {  // Thêm lệnh reset encoder
+            encoderCount = 0;
+            encoderCount2 = 0;
+            Serial.println("Encoders reset to 0");
         } else if (pendingCommand.startsWith("set_speed")) {
             int speedVal = pendingCommand.substring(9).toInt();
             speedVal = constrain(speedVal, 0, 255);
@@ -298,13 +303,13 @@ void motorForwardBoth() {
     // Motor 1 tiến
     digitalWrite(MOTOR_IN1, HIGH);
     digitalWrite(MOTOR_IN2, LOW);
-    analogWrite(ENA, currentMotorSpeed);
+    analogWrite(ENA, 100);
     motorDirection = 1;
     
     // Motor 2 tiến
     digitalWrite(MOTOR_IN3, HIGH);
     digitalWrite(MOTOR_IN4, LOW);
-    analogWrite(ENB, currentMotorSpeed);
+    analogWrite(ENB, 100*speedx);
     motorDirection2 = 1;
     Serial.println("Motors: Forward");
 }
@@ -313,13 +318,13 @@ void motorReverseBoth() {
     // Motor 1 lùi
     digitalWrite(MOTOR_IN1, LOW);
     digitalWrite(MOTOR_IN2, HIGH);
-    analogWrite(ENA, currentMotorSpeed);
+    analogWrite(ENA, 100);
     motorDirection = -1;
     
     // Motor 2 lùi
     digitalWrite(MOTOR_IN3, LOW);
     digitalWrite(MOTOR_IN4, HIGH);
-    analogWrite(ENB, currentMotorSpeed);
+    analogWrite(ENB, 100*speedx);
     motorDirection2 = -1;
     Serial.println("Motors: Reverse");
 }
@@ -328,13 +333,13 @@ void motorTurnLeft() {
     // Motor 1 lùi
     digitalWrite(MOTOR_IN1, LOW);
     digitalWrite(MOTOR_IN2, HIGH);
-    analogWrite(ENA, currentMotorSpeed);
+    analogWrite(ENA, 100);
     motorDirection = -1;
     
     // Motor 2 tiến
     digitalWrite(MOTOR_IN3, HIGH);
     digitalWrite(MOTOR_IN4, LOW);
-    analogWrite(ENB, currentMotorSpeed);
+    analogWrite(ENB, 100*speedx);
     motorDirection2 = 1;
     Serial.println("Motors: Turn Left");
 }
@@ -343,13 +348,13 @@ void motorTurnRight() {
     // Motor 1 tiến
     digitalWrite(MOTOR_IN1, HIGH);
     digitalWrite(MOTOR_IN2, LOW);
-    analogWrite(ENA, currentMotorSpeed);
+    analogWrite(ENA, 100);
     motorDirection = 1;
     
     // Motor 2 lùi
     digitalWrite(MOTOR_IN3, LOW);
     digitalWrite(MOTOR_IN4, HIGH);
-    analogWrite(ENB, currentMotorSpeed);
+    analogWrite(ENB, 100*speedx);
     motorDirection2 = -1;
     Serial.println("Motors: Turn Right");
 }
@@ -422,3 +427,5 @@ void motorSpeedPID(int targetSpeed, int currentSpeed) {
     
     previousSpeed = currentSpeed;
 }
+
+

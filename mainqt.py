@@ -128,7 +128,7 @@ class LidarData:
     MAX_DATA_SIZE = 180  # Tích lũy nhiều điểm trước khi vẽ
     NEIGHBOR_RADIUS = 48
     MIN_NEIGHBORS = 4
-    GRID_SIZE = 20      # mm
+    GRID_SIZE = 30      # mm
 
     def __init__(self, host='192.168.100.148', port=80, neighbor_radius=48, min_neighbors=4):
         self.host = host
@@ -240,8 +240,8 @@ class LidarData:
     def _to_global_coordinates(self, angles, distances):
         angles_np = np.array(angles)
         distances_np = np.array(distances)
-        global_x = self.pose_x + distances_np * np.cos(angles_np + self.pose_theta)
-        global_y = self.pose_y + distances_np * np.sin(angles_np + self.pose_theta)
+        global_x = self.pose_x + distances_np * np.cos(self.pose_theta - angles_np)
+        global_y = self.pose_y + distances_np * np.sin(self.pose_theta - angles_np)
         return global_x.tolist(), global_y.tolist()
 
     def _remove_outliers(self, x_coords, y_coords):
@@ -410,7 +410,7 @@ class LidarData:
                     # --- EKF SLAM Prediction ---
                     if not hasattr(self, 'ekf_slam'):
                         self.ekf_slam = EKFSLAM([self.pose_x, self.pose_y, self.pose_theta])
-                    motion_cov = np.diag([1e-3, 1e-3, 1e-4])
+                    motion_cov = np.diag([1e-1, 1e-1, 1e-2])
                     self.ekf_slam.predict(delta_s, delta_theta, motion_cov)
 
                     # Cập nhật pose từ EKF
@@ -442,7 +442,7 @@ class LidarData:
                     lx = self.ekf_slam.state[0] + meas_range * cos(self.ekf_slam.state[2] + meas_bearing)
                     ly = self.ekf_slam.state[1] + meas_range * sin(self.ekf_slam.state[2] + meas_bearing)
                     landmark_pos = np.array([lx, ly])
-                    measurement_cov = np.diag([1e-2, 1e-3])
+                    measurement_cov = np.diag([1e-3, 1e-4])
                     self.ekf_slam.update(z, landmark_pos, measurement_cov)
 
                 with self.data_lock:
@@ -493,7 +493,7 @@ class LidarData:
 # Chương trình chính
 # ------------------------------
 if __name__ == "__main__":
-    lidar = LidarData(host='192.168.0.113', port=80, neighbor_radius=50, min_neighbors=5)
+    lidar = LidarData(host='192.168.0.109', port=80, neighbor_radius=50, min_neighbors=5)
     data_thread = threading.Thread(target=lidar.update_data, daemon=True)
     data_thread.start()
 

@@ -1,6 +1,8 @@
 from PyQt5.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit, QSlider
 from PyQt5.QtCore import QTimer, Qt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from math import pi
+from PyQt5.QtWidgets import QMessageBox
 
 
 class LidarWindow(QMainWindow):
@@ -35,6 +37,17 @@ class LidarWindow(QMainWindow):
         conn_layout.addWidget(self.ip_input)
         conn_layout.addWidget(self.connect_btn)
         vbox.addLayout(conn_layout)
+
+        # ── Layout cho chỉnh hướng ban đầu ──
+        heading_layout = QHBoxLayout()
+        self.heading_input = QLineEdit()
+        self.heading_input.setPlaceholderText("Θ (deg)")
+        self.set_heading_btn = QPushButton("Set Heading")
+        self.set_heading_btn.clicked.connect(self.on_set_heading)
+        heading_layout.addWidget(QLabel("Adjust Heading:"))
+        heading_layout.addWidget(self.heading_input)
+        heading_layout.addWidget(self.set_heading_btn)
+        vbox.addLayout(heading_layout)
 
         # Layout cho thanh trượt điều khiển tốc độ (PWM 0-255)
         speed_layout = QHBoxLayout()
@@ -143,3 +156,28 @@ class LidarWindow(QMainWindow):
     def closeEvent(self, event):
         self.lidar.cleanup()
         event.accept()
+
+    def on_set_heading(self):
+        # 1) Đọc giá trị góc từ input
+        try:
+            theta_deg = float(self.heading_input.text())
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Input",
+                                "Θ phải là số (độ) hợp lệ!")
+            return
+
+        # 2) Chuyển sang radian
+        theta = theta_deg * pi / 180
+
+        # 3) Gọi backend và bắt lỗi
+        try:
+            self.lidar.set_heading(theta)
+        except Exception as e:
+            QMessageBox.critical(self, "Error Setting Heading",
+                                 f"Không thể điều chỉnh hướng:\n{e}")
+            return
+
+        # 4) Cập nhật status
+        self.status_label.setText(f"Hướng đã chỉnh: θ={theta_deg:.1f}°")
+
+

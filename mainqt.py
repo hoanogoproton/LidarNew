@@ -156,7 +156,7 @@ class LidarData:
 
         # Thông số encoder
         self.wheel_diameter = 70  # mm
-        self.ppr = 695            # pulses per revolution
+        self.ppr = 500            # pulses per revolution
         self.pi = 3.1416
         self.wheel_circumference = self.wheel_diameter * self.pi  # mm
 
@@ -180,6 +180,7 @@ class LidarData:
         # Khởi tạo với giá trị 127 (unknown); giá trị 0: free, 255: occupied
         self.global_map = np.full((self.global_map_dim, self.global_map_dim), 127, dtype=np.uint8)
 
+        self.pose_lock = threading.Lock()
         # Kết nối ban đầu
         if not self._connect_wifi():
             logging.error("Kết nối ban đầu không thành công. Vui lòng nhập IP ESP32 thủ công qua giao diện.")
@@ -192,6 +193,18 @@ class LidarData:
         self.command_thread.start()
         self.process_thread = threading.Thread(target=self.process_data, daemon=True)
         self.process_thread.start()
+
+    def set_heading(self, theta):
+        """
+        Chỉ cập nhật góc theta (rad), giữ nguyên x, y và bản đồ.
+        """
+        with self.pose_lock:
+            # chỉ set theta
+            self.pose_theta = theta
+            # nếu đã khởi tạo EKF, cập nhật luôn state[2]
+            if hasattr(self, 'ekf_slam'):
+                self.ekf_slam.state[2] = theta
+        logging.info(f"Heading adjusted to θ={theta:.3f} rad")
 
     def _connect_wifi(self):
         try:
@@ -373,7 +386,7 @@ class LidarData:
                 line, buffer = buffer.split('\n', 1)
                 logging.debug("Raw data received: %s", line)
                 sensor_data = line.strip().split('\t')
-                if len(sensor_data) != 9:
+                if len(sensor_data) != 10:  # Cập nhật từ 9 lên 10 vì thêm gyroZ
                     logging.warning("Sensor data length mismatch: %s", sensor_data)
                     continue
 
@@ -383,8 +396,9 @@ class LidarData:
                     distances = np.array(sensor_data[2:6], dtype=float)
                     encoder_count = int(sensor_data[7].strip())
                     encoder_count2 = int(sensor_data[8].strip())
-                    logging.info("Raw encoder values: encoder_count=%d, encoder_count2=%d",
-                                 encoder_count, encoder_count2)
+                    gyro_z = float(sensor_data[9].strip())  # Giá trị vận tốc góc từ MPU6050
+                    logging.info("Raw data: encoder_count=%d, encoder_count2=%d, gyroZ=%.2f rad/s",
+                                 encoder_count, encoder_count2, gyro_z)
                 except ValueError as e:
                     logging.error("Error parsing sensor data %s: %s", sensor_data, e)
                     continue
@@ -396,16 +410,28 @@ class LidarData:
                     self.initial_encoder_left = encoder_count
                     self.initial_encoder_right = encoder_count2
                     self.robot_distance = 0.0
+                    self.last_time = time.time()  # Thêm thời gian để tính delta_t
                     logging.info("Initialized encoders: left=%d, right=%d", encoder_count, encoder_count2)
                 else:
+                    current_time = time.time()
+                    delta_t = current_time - self.last_time  # Thời gian giữa hai lần đo (giây)
+                    self.last_time = current_time
+
                     delta_left = (encoder_count - self.last_encoder_left) * self.wheel_circumference / self.ppr  # mm
                     delta_right = (encoder_count2 - self.last_encoder_right) * self.wheel_circumference / self.ppr  # mm
                     delta_s = (delta_left + delta_right) / 2.0  # mm
-                    delta_theta = (delta_right - delta_left) / self.wheel_base  # radian
+                    delta_theta_enc = (delta_right - delta_left) / self.wheel_base  # radian từ encoder
+
+                    # Tính delta_theta_gyro mà không cần chuyển đổi deg/s sang radian
+                    delta_theta_gyro = gyro_z * delta_t  # radian
+
+                    # Kết hợp delta_theta từ encoder và MPU6050 (có thể dùng trọng số đơn giản)
+                    delta_theta = 1 * delta_theta_gyro + 0 * delta_theta_enc
 
                     logging.debug("Encoder: left=%d, right=%d, delta_left=%.2f mm, delta_right=%.2f mm",
                                   encoder_count, encoder_count2, delta_left, delta_right)
-                    logging.debug("Odometry: delta_s=%.2f mm, delta_theta=%.4f rad", delta_s, delta_theta)
+                    logging.debug("Odometry: delta_s=%.2f mm, delta_theta_enc=%.4f rad, delta_theta_gyro=%.4f rad",
+                                  delta_s, delta_theta_enc, delta_theta_gyro)
 
                     # --- EKF SLAM Prediction ---
                     if not hasattr(self, 'ekf_slam'):
@@ -432,12 +458,11 @@ class LidarData:
                 valid_angles = angles[valid_mask]
                 valid_distances = distances[valid_mask]
 
-                # Ví dụ: sử dụng đo đạc đầu tiên làm landmark update
                 if valid_angles.size > 0:
                     if not hasattr(self, 'ekf_slam'):
                         self.ekf_slam = EKFSLAM([self.pose_x, self.pose_y, self.pose_theta])
                     meas_range = valid_distances[0]
-                    meas_bearing = valid_angles[0] - self.pose_theta  # Góc đo tương đối
+                    meas_bearing = valid_angles[0] - self.pose_theta
                     z = np.array([meas_range, meas_bearing])
                     lx = self.ekf_slam.state[0] + meas_range * cos(self.ekf_slam.state[2] + meas_bearing)
                     ly = self.ekf_slam.state[1] + meas_range * sin(self.ekf_slam.state[2] + meas_bearing)
@@ -493,7 +518,7 @@ class LidarData:
 # Chương trình chính
 # ------------------------------
 if __name__ == "__main__":
-    lidar = LidarData(host='192.168.0.109', port=80, neighbor_radius=50, min_neighbors=5)
+    lidar = LidarData(host='192.168.0.131', port=80, neighbor_radius=50, min_neighbors=5)
     data_thread = threading.Thread(target=lidar.update_data, daemon=True)
     data_thread.start()
 

@@ -164,6 +164,7 @@ class LidarData:
         self.pose_x = 0.0
         self.pose_y = 0.0
         self.pose_theta = 0.0
+        self.heading_offset = 0.0  # Offset góc ban đầu là 0 (radian)
 
         self.last_encoder_left = None
         self.last_encoder_right = None
@@ -251,10 +252,10 @@ class LidarData:
         return x_coords.tolist(), y_coords.tolist()
 
     def _to_global_coordinates(self, angles, distances):
-        angles_np = np.array(angles)
+        angles_np = np.array(angles) + self.heading_offset  # Thêm offset vào góc
         distances_np = np.array(distances)
-        global_x = self.pose_x + distances_np * np.cos(self.pose_theta - angles_np)
-        global_y = self.pose_y + distances_np * np.sin(self.pose_theta - angles_np)
+        global_x = self.pose_x + distances_np * np.cos(self.pose_theta + angles_np)
+        global_y = self.pose_y + distances_np * np.sin(self.pose_theta + angles_np)
         return global_x.tolist(), global_y.tolist()
 
     def _remove_outliers(self, x_coords, y_coords):
@@ -513,12 +514,21 @@ class LidarData:
         plt.close(self.fig)
         logging.info("Plot closed.")
 
+    def reset_map(self):
+        # Đặt lại bản đồ toàn cục về trạng thái ban đầu (giá trị 127 - unknown)
+        self.global_map = np.full((self.global_map_dim, self.global_map_dim), 127, dtype=np.uint8)
+        # Xóa các tọa độ đã lưu (nếu cần)
+        with self.data_lock:
+            self.data['x_coords'].clear()
+            self.data['y_coords'].clear()
+        print("Đã xóa bản đồ.")  # Thay logging.info nếu không dùng logging
+
 
 # ------------------------------
 # Chương trình chính
 # ------------------------------
 if __name__ == "__main__":
-    lidar = LidarData(host='192.168.0.131', port=80, neighbor_radius=50, min_neighbors=5)
+    lidar = LidarData(host='192.168.0.133', port=80, neighbor_radius=50, min_neighbors=5)
     data_thread = threading.Thread(target=lidar.update_data, daemon=True)
     data_thread.start()
 

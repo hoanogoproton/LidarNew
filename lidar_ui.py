@@ -38,6 +38,19 @@ class LidarWindow(QMainWindow):
         conn_layout.addWidget(self.connect_btn)
         vbox.addLayout(conn_layout)
 
+        # Layout cho thanh trượt offset
+        offset_layout = QHBoxLayout()
+        self.offset_label = QLabel("Heading Offset (degrees):")
+        self.offset_slider = QSlider(Qt.Horizontal)
+        self.offset_slider.setRange(-180, 180)  # Phạm vi từ -180 đến 180 độ
+        self.offset_slider.setValue(0)  # Giá trị mặc định là 0
+        self.offset_value_label = QLabel("0")  # Hiển thị giá trị hiện tại
+        self.offset_slider.valueChanged.connect(self.change_offset)  # Kết nối sự kiện
+        offset_layout.addWidget(self.offset_label)
+        offset_layout.addWidget(self.offset_slider)
+        offset_layout.addWidget(self.offset_value_label)
+        vbox.addLayout(offset_layout)
+
         # ── Layout cho chỉnh hướng ban đầu ──
         heading_layout = QHBoxLayout()
         self.heading_input = QLineEdit()
@@ -180,4 +193,18 @@ class LidarWindow(QMainWindow):
         # 4) Cập nhật status
         self.status_label.setText(f"Hướng đã chỉnh: θ={theta_deg:.1f}°")
 
+    def change_offset(self, value):
+        # Cập nhật nhãn hiển thị giá trị offset
+        self.offset_value_label.setText(str(value))
+
+        # Chuyển đổi offset từ độ sang radian
+        offset_rad = value * (3.14159 / 180)  # Dùng 3.14159 thay pi nếu không import math
+
+        # Gán offset mới cho đối tượng LidarData
+        self.lidar.heading_offset = offset_rad
+
+        # Xóa bản đồ cũ và vẽ lại
+        self.lidar.reset_map()  # Gọi hàm xóa bản đồ
+        self.lidar._plot_map()  # Vẽ lại bản đồ với dữ liệu mới
+        self.canvas.draw()  # Cập nhật giao diện
 

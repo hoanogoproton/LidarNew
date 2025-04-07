@@ -9,6 +9,21 @@
 Adafruit_MPU6050 mpu;
 float gyroZ = 0.0;  // Vận tốc góc quanh trục Z (deg/s)
 
+// === MOTION COMMAND STATE MACHINE ===
+enum State { IDLE, RUN_DIST, RUN_ANGLE } state = IDLE;
+long targetTicks = 0;
+long startEnc1 = 0, startEnc2 = 0;
+float targetAngle = 0, startYaw = 0;
+float yaw = 0;
+unsigned long lastYawTime = 0;
+
+// Robot parameters (tùy chỉnh theo robot của bạn)
+const float WHEEL_RADIUS = 0.035;       // m
+const float WHEEL_BASE   = 0.175;       // m (khoảng cách tâm hai bánh)
+const int   ENCODER_PPR  = 500;        // xung/rev
+const float WHEEL_CIRCUMFERENCE = 2 * PI * WHEEL_RADIUS;
+
+
 // WiFi credentials mặc định
 char ssid[32] = "Wifii";
 char password[32] = "Nhucuong";
@@ -254,6 +269,8 @@ void setup() {
     Serial.println(gyroZBias, 4);
     Serial.println("Hiệu chỉnh hoàn tất.");
 
+    lastYawTime = millis();
+
     // Cấu hình motor 1
     pinMode(MOTOR_IN1, OUTPUT);
     pinMode(MOTOR_IN2, OUTPUT);
@@ -292,10 +309,9 @@ void setup() {
 void loop() {
     webServer.handleClient();
     handleClientCommands();
-    if (!newCommand) {
-        handleLidarData();
-    }
+    if (!newCommand) handleLidarData();
 
+    // Cập nhật gyroZ
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
     rawGyroZ = g.gyro.z;
@@ -303,16 +319,46 @@ void loop() {
 
     unsigned long currentTime = millis();
 
+    // 1) Integrate yaw from gyroZ
+    float dtYaw = (currentTime - lastYawTime) / 1000.0;
+    yaw += gyroZ * dtYaw;
+    lastYawTime = currentTime;
+
+    // 2) LIDAR PID
     if (currentTime - previousMillisLidar >= lidarLOOPTIME) {
         updateLidarPID();
         previousMillisLidar = currentTime;
     }
 
+    // 3) Wheel PID
     if (currentTime - previousMillisWheel >= wheelLOOPTIME) {
         updateWheelPID();
         previousMillisWheel = currentTime;
     }
 
+    // 4) Motion command state machine
+    if (state == RUN_DIST) {
+        long d1 = abs(encoderCount - startEnc1);
+        long d2 = abs(encoderCount2 - startEnc2);
+        long d = (d1 + d2) / 2;
+        if (d >= targetTicks) {
+            motorStopBoth();
+            state = IDLE;
+        } else {
+            motorForwardBoth();
+        }
+    } else if (state == RUN_ANGLE) {
+        float delta = yaw - startYaw;
+        if (abs(delta) >= abs(targetAngle)) {
+            motorStopBoth();
+            state = IDLE;
+        } else {
+            if (targetAngle > 0) motorTurnLeft();
+            else                 motorTurnRight();
+        }
+    }
+
+    // 5) Gửi dữ liệu
     static unsigned long lastSendTime = 0;
     if (currentTime - lastSendTime >= 20) {
         if (client.connected() && bufferIndex > 0) {
@@ -326,34 +372,45 @@ void loop() {
 void handleClientCommands() {
     if (!client || !client.connected()) {
         client = wifiServer.available();
-        if (client) {
-            Serial.println("Client connected");
-        }
+        if (client) Serial.println("Client connected");
     }
     if (client.connected() && client.available()) {
-        String command = client.readStringUntil('\n');
-        command.trim();
-        Serial.println("Received command: " + command);
-        newCommand = true;
-        pendingCommand = command;
+        String cmd = client.readStringUntil('\n');
+        cmd.trim();
+        Serial.println("Received command: " + cmd);
 
-        // Khi nhận lệnh, cập nhật hướng và setpoint cho 2 motor bánh xe
-        if (pendingCommand == "forward") {
+        // Nếu đang thực hiện lệnh di chuyển, bỏ qua các lệnh khác
+        if (state != IDLE) return;
+
+        // Lệnh MOVE D (m)
+        if (cmd.startsWith("MOVE ")) {
+            float D = cmd.substring(5).toFloat();
+            targetTicks = (D / WHEEL_CIRCUMFERENCE) * ENCODER_PPR;
+            startEnc1 = encoderCount;
+            startEnc2 = encoderCount2;
+            state = RUN_DIST;
+
+        // Lệnh ROTATE θ (deg)
+        } else if (cmd.startsWith("ROTATE ")) {
+            targetAngle = cmd.substring(7).toFloat();
+            startYaw = yaw;
+            state = RUN_ANGLE;
+
+        // Các lệnh cũ chỉ khi IDLE
+        } else if (cmd == "forward") {
             motorForwardBoth();
-        } else if (pendingCommand == "reverse") {
+        } else if (cmd == "reverse") {
             motorReverseBoth();
-        } else if (pendingCommand == "left") {
+        } else if (cmd == "left") {
             motorTurnLeft();
-        } else if (pendingCommand == "right") {
+        } else if (cmd == "right") {
             motorTurnRight();
-        } else if (pendingCommand == "stop") {
+        } else if (cmd == "stop") {
             motorStopBoth();
-        } else if (pendingCommand == "RESET_ENCODERS") {
-            encoderCount = 0;
-            encoderCount2 = 0;
+        } else if (cmd == "RESET_ENCODERS") {
+            encoderCount = encoderCount2 = 0;
             Serial.println("Encoders reset to 0");
         }
-        newCommand = false;
     }
 }
 

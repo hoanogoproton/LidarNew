@@ -95,6 +95,27 @@ class LidarWindow(QMainWindow):
         self.right_btn.pressed.connect(lambda: self.lidar.send_command("right"))
         self.right_btn.released.connect(lambda: self.lidar.send_command("stop"))
 
+        # ── ADD: Layout MOVE / ROTATE ──
+        mr_layout = QHBoxLayout()
+        # MOVE
+        mr_layout.addWidget(QLabel("Move (m):"))
+        self.move_input = QLineEdit()
+        self.move_input.setPlaceholderText("ví dụ 1.2")
+        mr_layout.addWidget(self.move_input)
+        self.move_btn = QPushButton("MOVE")
+        self.move_btn.clicked.connect(self.on_move)
+        mr_layout.addWidget(self.move_btn)
+        mr_layout.addSpacing(20)
+        # ROTATE
+        mr_layout.addWidget(QLabel("Rotate (°):"))
+        self.rotate_input = QLineEdit()
+        self.rotate_input.setPlaceholderText("ví dụ -90")
+        mr_layout.addWidget(self.rotate_input)
+        self.rotate_btn = QPushButton("ROTATE")
+        self.rotate_btn.clicked.connect(self.on_rotate)
+        mr_layout.addWidget(self.rotate_btn)
+        vbox.addLayout(mr_layout)
+
         # Nhãn hiển thị quãng đường đã đi (cm)
         self.status_label = QLabel("Robot Distance: 0.00 cm")
         btn_layout.addWidget(self.forward_btn)
@@ -166,6 +187,32 @@ class LidarWindow(QMainWindow):
         else:
             super().keyReleaseEvent(event)
 
+    def on_move(self):
+        text = self.move_input.text().strip()
+        try:
+            d = float(text)
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Input", "Distance phải là số (m) hợp lệ!")
+            return
+        # gửi lệnh MOVE D
+        cmd = f"MOVE {d}"
+        self.lidar.send_command(cmd)
+        self.status_label.setText(f"Sent: {cmd}")
+
+    def on_rotate(self):
+        text = self.rotate_input.text().strip()
+        try:
+            deg = float(text)
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Input", "Angle phải là số (°) hợp lệ!")
+            return
+        # Chuyển độ → radian
+        rad = deg * pi / 180.0
+        cmd = f"ROTATE {rad}"
+        self.lidar.send_command(cmd)
+        # Cập nhật status (nếu muốn hiển thị thêm độ)
+        self.status_label.setText(f"Sent: ROTATE {deg:.1f}° → {rad:.3f}rad")
+
     def closeEvent(self, event):
         self.lidar.cleanup()
         event.accept()
@@ -207,4 +254,3 @@ class LidarWindow(QMainWindow):
         self.lidar.reset_map()  # Gọi hàm xóa bản đồ
         self.lidar._plot_map()  # Vẽ lại bản đồ với dữ liệu mới
         self.canvas.draw()  # Cập nhật giao diện
-

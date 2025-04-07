@@ -487,6 +487,22 @@ class LidarData:
     def send_command(self, command):
         self.command_queue.put(command)
 
+    def move(self, distance_m):
+        """
+        Gửi lệnh di chuyển thẳng D (mét).
+        """
+        cmd = f"MOVE {distance_m}"
+        self.send_command(cmd)
+        logging.info("Move command sent: %s", cmd)
+
+    def rotate(self, angle_deg):
+        """
+        Gửi lệnh xoay tại chỗ θ (độ).
+        """
+        cmd = f"ROTATE {angle_deg}"
+        self.send_command(cmd)
+        logging.info("Rotate command sent: %s", cmd)
+
     def _handle_commands(self):
         while self.running:
             try:

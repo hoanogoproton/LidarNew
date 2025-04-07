@@ -2,10 +2,16 @@
 #include <WebServer.h>
 #include <EEPROM.h>
 #include <HardwareSerial.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+Adafruit_MPU6050 mpu;
+float gyroZ = 0.0;  // Vận tốc góc quanh trục Z (deg/s)
 
 // WiFi credentials mặc định
-char ssid[32] = "DIEN";
-char password[32] = "diennguyen123";
+char ssid[32] = "Wifii";
+char password[32] = "Nhucuong";
 WiFiServer wifiServer(80);  // Server cho điều khiển động cơ
 WebServer webServer(8080);  // Server cho cấu hình WiFi
 
@@ -16,47 +22,50 @@ WebServer webServer(8080);  // Server cho cấu hình WiFi
 #define DATA_1 4
 #define DATA_2 8
 #define DATA_3 12
-#define DATA_4 16 
+#define DATA_4 16
 #define CHECKSUM_LSB 20
 #define CHECKSUM_MSB 21
-#define PACKET_SIZE 22  
-#define DATA_SIZE 7 
+#define PACKET_SIZE 22
+#define DATA_SIZE 7
 #define BUFFER_SIZE 50
 
 #define RX_PIN 16
-#define MOTOR_PIN 5
-#define BAUDRATE_SENSOR 115200  
-#define MAX_POWER 255   
-#define MOTOR_SPEED 250
+#define MOTOR_PIN 5          // Dùng cho motor LIDAR (PID đã bị xóa)
+#define BAUDRATE_SENSOR 115200
+#define MAX_POWER 255
+#define MOTOR_SPEED 20
 
+// Định nghĩa chân cho Motor 1
 #define MOTOR_IN1 18
 #define MOTOR_IN2 19
-#define ENA 21
-#define ENCODER_PIN 22
+#define ENA 15
+#define ENCODER_PIN 4
 
-// Thêm chân cho Motor 2
+// Định nghĩa chân cho Motor 2
 #define MOTOR_IN3 23
 #define MOTOR_IN4 25
 #define ENB 26
 #define ENCODER_PIN2 27
 
-// Biến encoder cho bánh xe thứ hai
-volatile long encoderCount2 = 0; // Đếm xung encoder bánh xe thứ hai
-int motorDirection2 = 0;         // Hướng motor thứ hai (1: tiến, -1: lùi, 0: dừng)
+// Biến encoder cho bánh xe
+volatile long encoderCount = 0;      // Encoder motor 1
+volatile long encoderCount2 = 0;     // Encoder motor 2
+// Hướng chuyển động của từng motor (1: tiến, -1: lùi, 0: dừng)
+int motorDirection = 0;
+int motorDirection2 = 0;
 
 const int encoderMin = -32768;
 const int encoderMax = 32767;
 
-const float speedx = 1.1;
+float gyroZBias = 0.0;
+float rawGyroZ;
 
 // Định nghĩa cho EEPROM
 #define EEPROM_SIZE 128
 #define SSID_ADDR 0
 #define PASS_ADDR 32
 
-// Biến toàn cục
-volatile long encoderCount = 0;
-int motorDirection = 0;
+// Các biến liên quan đến LIDAR
 int data[DATA_SIZE];
 uint8_t packet[PACKET_SIZE];
 uint8_t lidarBuffer[PACKET_SIZE * BUFFER_SIZE];
@@ -67,23 +76,66 @@ bool waitPacket = true;
 volatile bool newCommand = false;
 String pendingCommand = "";
 
-// PID parameters
-double kp = 2.0, ki = 0, kd = 0;
-double proportionalTerm = 0;
-double derivativeTerm = 0;
-double integralTerm = 0;
-double previousSpeed = 0;
-int controlEffort = 0;
-unsigned long lastPIDTime = 0;
-unsigned long lastSendTime = 0;
+// Thêm vào phần khai báo toàn cục
+double setpointLidar = 250;  // Tốc độ mong muốn cho LIDAR
+double currentSpeedLidar = 0.0;      // Tốc độ hiện tại của LIDAR
+double errorLidar = 0.0;
+double lastErrorLidar = 0.0;
+double integralLidar = 0.0;
+double derivativeLidar = 0.0;
+double outputLidar = 0.0;
+double Kp_lidar = 2.0;
+double Ki_lidar = 0.3;
+double Kd_lidar = 0.3;
+unsigned long previousMillisLidar = 0;
+const unsigned long lidarLOOPTIME = 50;
 
 HardwareSerial lidarSerial(1);
 WiFiClient client;
 
-// Biến lưu tốc độ hiện tại được điều khiển thông qua ENA (PWM 0-255)
+// Biến lưu tốc độ hiện tại cho motor Lidar (PWM 0-255)
 int currentMotorSpeed = MOTOR_SPEED;
 
-// Interrupt Service Routine cho encoder
+// ======== PHẦN THÊM: PID cho 2 động cơ bánh xe ========
+// Thời gian lặp PID cho bánh xe (ms)
+unsigned long previousMillisWheel = 0;
+const unsigned long wheelLOOPTIME = 50;  // 50ms -> 20Hz
+
+// Lưu giá trị encoder của lần lặp trước
+volatile long encoder1Prev = 0;
+volatile long encoder2Prev = 0;
+
+// Setpoint (số xung trong vòng lặp) của từng motor
+int setPointWheel1 = MOTOR_SPEED;
+int setPointWheel2 = MOTOR_SPEED;
+
+// Giá trị đo được (số xung trong vòng lặp)
+int processWheel1 = 0, processWheel2 = 0;
+
+// Các biến PID riêng cho mỗi motor bánh xe
+int errorWheel1 = 0, lastErrorWheel1 = 0, dErrorWheel1 = 0;
+int errorWheel2 = 0, lastErrorWheel2 = 0, dErrorWheel2 = 0;
+int pidOutputWheel1 = 0, pidOutputWheel2 = 0;
+// Hệ số PID (có thể điều chỉnh)
+int Kp_wheel = 2;
+int Kd_wheel = 0;
+// (Không dùng phần tích phân cho đơn giản)
+
+// ======== HẾT PHẦN THÊM ========
+
+// Thêm hàm updateLidarPID
+void updateLidarPID() {
+    errorLidar = setpointLidar - currentSpeedLidar;
+    integralLidar += errorLidar * (lidarLOOPTIME / 1000.0);
+    integralLidar = constrain(integralLidar, -100, 100);
+    derivativeLidar = (errorLidar - lastErrorLidar) / (lidarLOOPTIME / 1000.0);
+    lastErrorLidar = errorLidar;
+    outputLidar = Kp_lidar * errorLidar + Ki_lidar * integralLidar + Kd_lidar * derivativeLidar;
+    outputLidar = constrain(outputLidar, 0, MAX_POWER);
+    analogWrite(MOTOR_PIN, (int)outputLidar);
+}
+
+// Interrupt Service Routine cho encoder motor 1
 void IRAM_ATTR encoderISR() {
     if (motorDirection == 1) {
         if (encoderCount < encoderMax) encoderCount++;
@@ -94,6 +146,7 @@ void IRAM_ATTR encoderISR() {
     }
 }
 
+// Interrupt Service Routine cho encoder motor 2
 void IRAM_ATTR encoderISR2() {
     if (motorDirection2 == 1) { // Tiến
         if (encoderCount2 < encoderMax) encoderCount2++;
@@ -104,7 +157,6 @@ void IRAM_ATTR encoderISR2() {
     }
 }
 
-// Đọc dữ liệu từ EEPROM
 void readEEPROM() {
     for (int i = 0; i < 32; i++) {
         ssid[i] = EEPROM.read(SSID_ADDR + i);
@@ -112,7 +164,6 @@ void readEEPROM() {
     }
 }
 
-// Ghi dữ liệu vào EEPROM
 void writeEEPROM(const char* newSSID, const char* newPass) {
     for (int i = 0; i < 32; i++) {
         EEPROM.write(SSID_ADDR + i, i < strlen(newSSID) ? newSSID[i] : 0);
@@ -121,8 +172,6 @@ void writeEEPROM(const char* newSSID, const char* newPass) {
     EEPROM.commit();
 }
 
-
-// Kết nối WiFi
 bool connectWiFi() {
     WiFi.begin(ssid, password);
     int attempts = 0;
@@ -134,7 +183,6 @@ bool connectWiFi() {
     return WiFi.status() == WL_CONNECTED;
 }
 
-// Khởi động chế độ AP
 void startAPMode() {
     WiFi.mode(WIFI_AP);
     WiFi.softAP("ESP32_Config", "12345678");
@@ -142,7 +190,6 @@ void startAPMode() {
     Serial.println(WiFi.softAPIP());
 }
 
-// Xử lý yêu cầu gốc cho WebServer
 void handleRoot() {
     String page = "<!DOCTYPE html><html><body><h2>WiFi Config</h2>";
     page += "<p>Current SSID: " + String(ssid) + "</p>";
@@ -154,7 +201,6 @@ void handleRoot() {
     webServer.send(200, "text/html", page);
 }
 
-// Xử lý lưu WiFi mới
 void handleSave() {
     String newSSID = webServer.arg("ssid");
     String newPass = webServer.arg("pass");
@@ -176,8 +222,37 @@ void setup() {
     WiFi.begin(ssid, password);
     pinMode(MOTOR_PIN, OUTPUT);
     lidarSerial.begin(BAUDRATE_SENSOR, SERIAL_8N1, RX_PIN, -1);
-    analogWrite(MOTOR_PIN, 125);
-    lastPIDTime = millis();
+    // Điều khiển motor Lidar với tốc độ cố định
+    analogWrite(MOTOR_PIN, 150);
+
+    // Khởi tạo giao thức I2C cho MPU6050
+    Wire.begin(21, 22);
+
+    if (!mpu.begin()) {
+        Serial.println("Failed to find MPU6050 chip");
+        while (1) {
+            delay(10);
+        }
+    }
+    Serial.println("MPU6050 Found!");
+
+    mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+    mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+    Serial.println("Hiệu chỉnh gyro, vui lòng giữ hệ thống đứng yên...");
+    const int calibrationSamples = 1000;
+    float sumGyroZ = 0.0;
+    for (int i = 0; i < calibrationSamples; i++) {
+        sensors_event_t a, g, temp;
+        mpu.getEvent(&a, &g, &temp);
+        sumGyroZ += g.gyro.z;
+        delay(5);
+    }
+    gyroZBias = sumGyroZ / calibrationSamples;
+    Serial.print("Bias của gyroZ: ");
+    Serial.println(gyroZBias, 4);
+    Serial.println("Hiệu chỉnh hoàn tất.");
 
     // Cấu hình motor 1
     pinMode(MOTOR_IN1, OUTPUT);
@@ -193,9 +268,9 @@ void setup() {
     pinMode(ENCODER_PIN2, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(ENCODER_PIN2), encoderISR2, CHANGE);
 
-    motorStopBoth(); // Dừng cả hai motor khi khởi động
+    // Khi khởi động, dừng cả hai motor bánh xe
+    motorStopBoth();
 
-    // Kết nối WiFi hoặc chuyển sang AP (giữ nguyên phần còn lại)
     if (!connectWiFi()) {
         Serial.println("\nWiFi connection failed. Starting AP mode...");
         startAPMode();
@@ -211,22 +286,34 @@ void setup() {
         webServer.begin();
     }
     Serial.println("Encoder monitoring started");
-
 }
 
+// Cập nhật loop
 void loop() {
-    webServer.handleClient(); // Xử lý yêu cầu cấu hình WiFi
-
+    webServer.handleClient();
     handleClientCommands();
     if (!newCommand) {
         handleLidarData();
     }
+
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    rawGyroZ = g.gyro.z;
+    gyroZ = rawGyroZ - gyroZBias;
+
     unsigned long currentTime = millis();
-    if (currentTime - lastPIDTime >= 100) {
-        motorSpeedPID(MOTOR_SPEED, data[1]);
-        lastPIDTime = currentTime;
+
+    if (currentTime - previousMillisLidar >= lidarLOOPTIME) {
+        updateLidarPID();
+        previousMillisLidar = currentTime;
     }
 
+    if (currentTime - previousMillisWheel >= wheelLOOPTIME) {
+        updateWheelPID();
+        previousMillisWheel = currentTime;
+    }
+
+    static unsigned long lastSendTime = 0;
     if (currentTime - lastSendTime >= 20) {
         if (client.connected() && bufferIndex > 0) {
             sendDataToClient();
@@ -250,6 +337,7 @@ void handleClientCommands() {
         newCommand = true;
         pendingCommand = command;
 
+        // Khi nhận lệnh, cập nhật hướng và setpoint cho 2 motor bánh xe
         if (pendingCommand == "forward") {
             motorForwardBoth();
         } else if (pendingCommand == "reverse") {
@@ -260,21 +348,10 @@ void handleClientCommands() {
             motorTurnRight();
         } else if (pendingCommand == "stop") {
             motorStopBoth();
-        } else if (pendingCommand == "RESET_ENCODERS") {  // Thêm lệnh reset encoder
+        } else if (pendingCommand == "RESET_ENCODERS") {
             encoderCount = 0;
             encoderCount2 = 0;
             Serial.println("Encoders reset to 0");
-        } else if (pendingCommand.startsWith("set_speed")) {
-            int speedVal = pendingCommand.substring(9).toInt();
-            speedVal = constrain(speedVal, 0, 255);
-            currentMotorSpeed = speedVal;
-            // Cập nhật tốc độ cho cả hai motor nếu đang chạy
-            if (motorDirection != 0 || motorDirection2 != 0) {
-                analogWrite(ENA, currentMotorSpeed);
-                analogWrite(ENB, currentMotorSpeed);
-            }
-            Serial.print("Motor speed set to: ");
-            Serial.println(currentMotorSpeed);
         }
         newCommand = false;
     }
@@ -299,81 +376,110 @@ void handleLidarData() {
     }
 }
 
-void motorForwardBoth() {
-    // Motor 1 tiến
-    digitalWrite(MOTOR_IN1, HIGH);
-    digitalWrite(MOTOR_IN2, LOW);
-    analogWrite(ENA, 100);
-    motorDirection = 1;
+// ----- CÁC HÀM ĐIỀU KHIỂN MOTOR BÁNH XE (SỬ DỤNG PID) -----
+void updateWheelPID() {
+    // Tính số xung (process value) trong vòng lặp của từng motor
+    processWheel1 = encoderCount - encoder1Prev;
+    encoder1Prev = encoderCount;
+    processWheel2 = encoderCount2 - encoder2Prev;
+    encoder2Prev = encoderCount2;
 
-    // Motor 2 tiến
-    digitalWrite(MOTOR_IN3, HIGH);
-    digitalWrite(MOTOR_IN4, LOW);
-    analogWrite(ENB, 100*speedx);
+    // Motor 1 PID
+    errorWheel1 = setPointWheel1 - processWheel1;
+    dErrorWheel1 = errorWheel1 - lastErrorWheel1;
+    lastErrorWheel1 = errorWheel1;
+    pidOutputWheel1 = pidOutputWheel1 + Kp_wheel * errorWheel1 + Kd_wheel * dErrorWheel1;
+    pidOutputWheel1 = constrain(pidOutputWheel1, 0, MAX_POWER);
+
+    // Motor 2 PID
+    errorWheel2 = setPointWheel2 - processWheel2;
+    dErrorWheel2 = errorWheel2 - lastErrorWheel2;
+    lastErrorWheel2 = errorWheel2;
+    pidOutputWheel2 = pidOutputWheel2 + Kp_wheel * errorWheel2 + Kd_wheel * dErrorWheel2;
+    pidOutputWheel2 = constrain(pidOutputWheel2, 0, MAX_POWER);
+
+    // Cập nhật PWM và hướng cho motor 1
+    if (motorDirection == 1) {
+        digitalWrite(MOTOR_IN1, HIGH);
+        digitalWrite(MOTOR_IN2, LOW);
+        analogWrite(ENA, pidOutputWheel1);
+    } else if (motorDirection == -1) {
+        digitalWrite(MOTOR_IN1, LOW);
+        digitalWrite(MOTOR_IN2, HIGH);
+        analogWrite(ENA, pidOutputWheel1);
+    } else { // Dừng motor
+        digitalWrite(MOTOR_IN1, LOW);
+        digitalWrite(MOTOR_IN2, LOW);
+        analogWrite(ENA, 0);
+    }
+
+    // Cập nhật PWM và hướng cho motor 2
+    if (motorDirection2 == 1) {
+        digitalWrite(MOTOR_IN3, HIGH);
+        digitalWrite(MOTOR_IN4, LOW);
+        analogWrite(ENB, pidOutputWheel2);
+    } else if (motorDirection2 == -1) {
+        digitalWrite(MOTOR_IN3, LOW);
+        digitalWrite(MOTOR_IN4, HIGH);
+        analogWrite(ENB, pidOutputWheel2);
+    } else { // Dừng motor
+        digitalWrite(MOTOR_IN3, LOW);
+        digitalWrite(MOTOR_IN4, LOW);
+        analogWrite(ENB, 0);
+    }
+}
+
+// Các hàm điều khiển hướng cho 2 motor bánh xe
+void motorForwardBoth() {
+    // Cập nhật hướng cho motor 1 và motor 2
+    motorDirection = 1;
     motorDirection2 = 1;
+    // Cập nhật setpoint cho bánh xe
+    setPointWheel1 = MOTOR_SPEED;
+    setPointWheel2 = MOTOR_SPEED;
     Serial.println("Motors: Forward");
 }
 
 void motorReverseBoth() {
-    // Motor 1 lùi
-    digitalWrite(MOTOR_IN1, LOW);
-    digitalWrite(MOTOR_IN2, HIGH);
-    analogWrite(ENA, 100);
     motorDirection = -1;
-
-    // Motor 2 lùi
-    digitalWrite(MOTOR_IN3, LOW);
-    digitalWrite(MOTOR_IN4, HIGH);
-    analogWrite(ENB, 100*speedx);
     motorDirection2 = -1;
+    setPointWheel1 = MOTOR_SPEED;
+    setPointWheel2 = MOTOR_SPEED;
     Serial.println("Motors: Reverse");
 }
 
 void motorTurnLeft() {
-    // Motor 1 lùi
-    digitalWrite(MOTOR_IN1, LOW);
-    digitalWrite(MOTOR_IN2, HIGH);
-    analogWrite(ENA, 100);
+    // Ví dụ: motor trái chạy chậm hơn, motor phải chạy nhanh hơn
     motorDirection = -1;
-
-    // Motor 2 tiến
-    digitalWrite(MOTOR_IN3, HIGH);
-    digitalWrite(MOTOR_IN4, LOW);
-    analogWrite(ENB, 100*speedx);
     motorDirection2 = 1;
+    setPointWheel1 = MOTOR_SPEED / 2;
+    setPointWheel2 = MOTOR_SPEED;
     Serial.println("Motors: Turn Left");
 }
 
 void motorTurnRight() {
-    // Motor 1 tiến
-    digitalWrite(MOTOR_IN1, HIGH);
-    digitalWrite(MOTOR_IN2, LOW);
-    analogWrite(ENA, 100);
     motorDirection = 1;
-
-    // Motor 2 lùi
-    digitalWrite(MOTOR_IN3, LOW);
-    digitalWrite(MOTOR_IN4, HIGH);
-    analogWrite(ENB, 100*speedx);
     motorDirection2 = -1;
+    setPointWheel1 = MOTOR_SPEED;
+    setPointWheel2 = MOTOR_SPEED / 2;
     Serial.println("Motors: Turn Right");
 }
 
 void motorStopBoth() {
-    // Dừng motor 1
+    motorDirection = 0;
+    motorDirection2 = 0;
+    setPointWheel1 = 0;
+    setPointWheel2 = 0;
     digitalWrite(MOTOR_IN1, LOW);
     digitalWrite(MOTOR_IN2, LOW);
     analogWrite(ENA, 0);
-    motorDirection = 0;
-
-    // Dừng motor 2
     digitalWrite(MOTOR_IN3, LOW);
     digitalWrite(MOTOR_IN4, LOW);
     analogWrite(ENB, 0);
-    motorDirection2 = 0;
     Serial.println("Motors: Stopped");
 }
 
+// ----- Các hàm xử lý dữ liệu LIDAR và checksum -----
 void decodePacket(uint8_t packet[], int packetSize) {
     int data_idx = 0;
     for (int idx = 0; idx < DATA_SIZE; idx++) data[idx] = 0;
@@ -385,6 +491,7 @@ void decodePacket(uint8_t packet[], int packetSize) {
         } else if (i == SPEED_LSB) {
             int speed = ((packet[SPEED_MSB] << 8) | packet[SPEED_LSB]) / 64;
             data[data_idx++] = speed;
+            currentSpeedLidar = speed;  // Cập nhật tốc độ LIDAR
         } else if (i == DATA_1 || i == DATA_2 || i == DATA_3 || i == DATA_4) {
             uint16_t distance = ((packet[i+1] & 0x3F) << 8) | packet[i];
             data[data_idx++] = distance;
@@ -398,7 +505,7 @@ void sendDataToClient() {
     for (int i = 0; i < DATA_SIZE; i++) {
         dataString += String(data[i]) + "\t";
     }
-    dataString += String(encoderCount) + "\t" + String(encoderCount2); // Gửi cả hai encoder
+    dataString += String(encoderCount) + "\t" + String(encoderCount2) + "\t" + String(gyroZ, 2);
     client.println(dataString);
     Serial.println("Sent: " + dataString);
 }
@@ -410,21 +517,3 @@ uint16_t checksum(uint8_t packet[], uint8_t size) {
     }
     return (uint16_t)((chk32 & 0x7FFF) + (chk32 >> 15)) & 0x7FFF;
 }
-
-void motorSpeedPID(int targetSpeed, int currentSpeed) {
-    unsigned long currentTime = millis();
-    double deltaT = (currentTime - lastPIDTime) / 1000.0;
-    if (deltaT <= 0) deltaT = 0.1;
-
-    proportionalTerm = targetSpeed - currentSpeed;
-    derivativeTerm = (currentSpeed - previousSpeed) / deltaT;
-    integralTerm += proportionalTerm * deltaT;
-    integralTerm = constrain(integralTerm, -50, 50);
-
-    controlEffort = kp * proportionalTerm + kd * derivativeTerm + ki * integralTerm;
-    controlEffort = constrain(controlEffort, 0, MAX_POWER);
-    analogWrite(MOTOR_PIN, controlEffort);
-
-    previousSpeed = currentSpeed;
-}
-

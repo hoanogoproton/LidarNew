@@ -36,8 +36,8 @@ def a_star_search(grid, start, goal):
         neighbors = [(current[0]-1, current[1]), (current[0]+1, current[1]),
                      (current[0], current[1]-1), (current[0], current[1]+1)]
         for next in neighbors:
-            # Kiểm tra nằm ngoài lưới và tránh các ô bị chiếm (255 là occupied)
-            if 0 <= next[0] < cols and 0 <= next[1] < rows and grid[next[1], next[0]] == 0:
+            if (0 <= next[0] < cols and 0 <= next[1] < rows and
+                grid[next[1], next[0]] != 255):  # Cho phép các ô unknown (127) và free (0)
                 new_cost = cost_so_far[current] + 1
                 if next not in cost_so_far or new_cost < cost_so_far[next]:
                     cost_so_far[next] = new_cost
@@ -57,6 +57,7 @@ def a_star_search(grid, start, goal):
     path.append(start)
     path.reverse()
     return path
+
 
 # ------------------------------
 # Hàm Bresenham cho việc tìm các ô trong grid theo đường ray
@@ -92,8 +93,37 @@ def bresenham_line(x0, y0, x1, y1):
     points.append((x1, y1))
     return points
 
+def is_collision_free(p1, p2, grid):
+    """
+    Kiểm tra đường thẳng từ p1 đến p2 trong occupancy grid có va chạm với chướng ngại vật hay không.
+    p1, p2: tuple (x, y) của chỉ số ô (grid coordinates)
+    grid: occupancy grid với 0 là free, 255 là obstacle.
+    Giả sử các ô có giá trị 127 (unknown) cũng được coi là free.
+    """
+    cells = bresenham_line(p1[0], p1[1], p2[0], p2[1])
+    for cell in cells:
+        x, y = cell
+        # Nếu ô có giá trị 255 (occupied) thì coi là va chạm
+        if grid[y, x] == 255:
+            return False
+    return True
 
-
+def smooth_path(path, grid):
+    if not path or len(path) < 2:
+        return path
+    smoothed = [path[0]]
+    i = 0
+    while i < len(path) - 1:
+        for j in range(len(path) - 1, i, -1):
+            if is_collision_free(smoothed[-1], path[j], grid):
+                smoothed.append(path[j])
+                i = j
+                break
+        else:
+            # Nếu không tìm được điểm nào xa hơn, thêm điểm tiếp theo
+            smoothed.append(path[i + 1])
+            i += 1
+    return smoothed
 # ------------------------------
 # Lớp EKF SLAM
 # ------------------------------
@@ -516,6 +546,7 @@ class LidarData:
         Tính toán đường đi từ vị trí hiện tại đến điểm đích (target_x, target_y) và điều khiển robot.
         target_x, target_y: tọa độ điểm đích (mm) trong hệ tọa độ toàn cục.
         """
+        # Chuyển đổi tọa độ thực sang chỉ số lưới
         grid_target = (int((target_x + self.map_size_mm / 2) / self.GRID_SIZE),
                        int((target_y + self.map_size_mm / 2) / self.GRID_SIZE))
         grid_start = (int((self.pose_x + self.map_size_mm / 2) / self.GRID_SIZE),
@@ -524,21 +555,40 @@ class LidarData:
         if not path:
             print("Không tìm được đường đi đến đích!")
             return
-        print("Đường đi đã tính được:", path)
-        for cell in path:
-            waypoint_x = cell[0] * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2
-            waypoint_y = cell[1] * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2
-            desired_angle = atan2(waypoint_y - self.pose_y, waypoint_x - self.pose_x)
+        print("Đường đi ban đầu:", path)
+
+        # Thực hiện tối ưu (smoothing) đường đi
+        smooth_waypoints = smooth_path(path, self.global_map)
+        if len(smooth_waypoints) <= 1:
+            print("Đường đi sau smoothing chỉ có điểm hiện tại, không có lộ trình di chuyển!")
+            return
+        print("Đường đi sau khi làm mượt:", smooth_waypoints)
+
+        # Chuyển đổi các cell sang tọa độ thực (mm)
+        waypoints_x = []
+        waypoints_y = []
+        for cell in smooth_waypoints:
+            wx = cell[0] * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2
+            wy = cell[1] * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2
+            waypoints_x.append(wx)
+            waypoints_y.append(wy)
+
+        # Hiển thị các waypoint sau khi làm mượt lên bản đồ
+        self.ax.plot(waypoints_x, waypoints_y, 'bo-', markersize=5, label='Smoothed Waypoints')
+        self.ax.legend()
+        self.fig.canvas.draw()
+
+        # Điều khiển robot theo các waypoint mượt
+        for wx, wy in zip(waypoints_x, waypoints_y):
+            desired_angle = atan2(wy - self.pose_y, wx - self.pose_x)
             angle_diff = desired_angle - self.pose_theta
             angle_diff = atan2(sin(angle_diff), cos(angle_diff))
-            print(f"Di chuyển đến waypoint tại ({waypoint_x:.1f}, {waypoint_y:.1f}); cần xoay {angle_diff:.3f} rad")
-            # Gọi lệnh xoay với giá trị radian trực tiếp
+            print(f"Di chuyển đến waypoint tại ({wx:.1f}, {wy:.1f}); cần xoay {angle_diff:.3f} rad")
             self.rotate(angle_diff)
-            time.sleep(0.5)
-            distance = sqrt((waypoint_x - self.pose_x) ** 2 + (waypoint_y - self.pose_y) ** 2)
-            print(f"Tiến hành di chuyển khoảng cách {distance:.1f} mm")
+            time.sleep(3)  # Đợi 2 giây để hoàn thành xoay
+            distance = sqrt((wx - self.pose_x) ** 2 + (wy - self.pose_y) ** 2)
             self.move(distance / 1000)
-            time.sleep(1)
+            time.sleep(max(2, distance / 100)+2)  # Đợi dựa trên khoảng cách (giả sử tốc độ 100 mm/s)
         print("Đã hoàn thành di chuyển đến vị trí đích")
 
 

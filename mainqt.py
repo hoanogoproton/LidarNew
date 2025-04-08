@@ -9,12 +9,54 @@ from scipy.spatial import cKDTree
 from math import pi, cos, sin, atan2, sqrt
 from PyQt5.QtWidgets import QApplication
 import logging
+import heapq
 
 from lidar_ui import LidarWindow  # Nhập giao diện từ file lidar_ui.py
 
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
+def heuristic(a, b):
+    # Sử dụng khoảng cách Euclid
+    return sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+
+def a_star_search(grid, start, goal):
+    rows, cols = grid.shape
+    open_set = []
+    heapq.heappush(open_set, (0, start))
+    came_from = {}
+    cost_so_far = {start: 0}
+
+    while open_set:
+        current_priority, current = heapq.heappop(open_set)
+        if current == goal:
+            break
+
+        # Lấy các ô láng giềng theo 4 hướng (trên, dưới, trái, phải)
+        neighbors = [(current[0]-1, current[1]), (current[0]+1, current[1]),
+                     (current[0], current[1]-1), (current[0], current[1]+1)]
+        for next in neighbors:
+            # Kiểm tra nằm ngoài lưới và tránh các ô bị chiếm (255 là occupied)
+            if 0 <= next[0] < cols and 0 <= next[1] < rows and grid[next[1], next[0]] == 0:
+                new_cost = cost_so_far[current] + 1
+                if next not in cost_so_far or new_cost < cost_so_far[next]:
+                    cost_so_far[next] = new_cost
+                    priority = new_cost + heuristic(goal, next)
+                    heapq.heappush(open_set, (priority, next))
+                    came_from[next] = current
+
+    # Xây dựng đường đi nếu có
+    path = []
+    current = goal
+    while current != start:
+        path.append(current)
+        current = came_from.get(current)
+        if current is None:
+            # Nếu không tìm được đường đi, trả về danh sách rỗng
+            return []
+    path.append(start)
+    path.reverse()
+    return path
 
 # ------------------------------
 # Hàm Bresenham cho việc tìm các ô trong grid theo đường ray
@@ -51,6 +93,7 @@ def bresenham_line(x0, y0, x1, y1):
     return points
 
 
+
 # ------------------------------
 # Lớp EKF SLAM
 # ------------------------------
@@ -62,61 +105,37 @@ class EKFSLAM:
         self.cov = np.eye(3) * 0.1
 
     def predict(self, delta_s, delta_theta, motion_cov):
-        """
-        Dự đoán pose dựa trên mô hình chuyển động.
-        delta_s: khoảng cách di chuyển (mm)
-        delta_theta: thay đổi góc (radian)
-        motion_cov: ma trận nhiễu của mô hình chuyển động
-        """
         theta = self.state[2]
-        # Cập nhật pose theo mô hình chuyển động
         dx = delta_s * cos(theta + delta_theta / 2)
         dy = delta_s * sin(theta + delta_theta / 2)
         self.state[0] += dx
         self.state[1] += dy
         self.state[2] += delta_theta
-        # Chuẩn hóa góc về [-pi, pi]
         self.state[2] = atan2(sin(self.state[2]), cos(self.state[2]))
-
-        # Tính jacobian của mô hình chuyển động theo state
         F = np.array([
             [1, 0, -delta_s * sin(theta + delta_theta / 2)],
             [0, 1,  delta_s * cos(theta + delta_theta / 2)],
             [0, 0, 1]
         ])
-        # Cập nhật covariance
         self.cov = F @ self.cov @ F.T + motion_cov
 
     def update(self, z, landmark_pos, measurement_cov):
-        """
-        Cập nhật pose dựa trên đo đạc landmark.
-        z: đo đạc [range, bearing] (theo hệ tọa độ của robot)
-        landmark_pos: vị trí landmark trong hệ tọa độ toàn cục (giả sử đã biết)
-        measurement_cov: ma trận nhiễu của đo đạc
-        """
         dx = landmark_pos[0] - self.state[0]
         dy = landmark_pos[1] - self.state[1]
         q = dx**2 + dy**2
         expected_range = sqrt(q)
         expected_bearing = atan2(dy, dx) - self.state[2]
         z_hat = np.array([expected_range, expected_bearing])
-
-        # Tính sai lệch đo đạc (innovation)
         y = z - z_hat
-        y[1] = atan2(sin(y[1]), cos(y[1]))  # chuẩn hóa góc
-
-        # Tính jacobian của phép đo theo state
+        y[1] = atan2(sin(y[1]), cos(y[1]))
         H = np.array([
             [-dx / expected_range, -dy / expected_range, 0],
             [dy / q,              -dx / q,             -1]
         ])
         S = H @ self.cov @ H.T + measurement_cov
         K = self.cov @ H.T @ np.linalg.inv(S)
-
-        # Cập nhật state và covariance
         self.state = self.state + K @ y
         self.cov = (np.eye(3) - K @ H) @ self.cov
-
 
 # ------------------------------
 # Lớp xử lý dữ liệu LiDAR, odometry và xây dựng bản đồ toàn cục
@@ -135,11 +154,8 @@ class LidarData:
         self.port = port
         self.sock = None
         self.data = {
-            'angles': [],
-            'distances': [],
-            'speed': [],
-            'x_coords': [],
-            'y_coords': [],
+            'angles': [], 'distances': [], 'speed': [],
+            'x_coords': [], 'y_coords': []
         }
         self.grid = None
         self.robot_distance = 0.0  # Tổng quãng đường đã đi (mm)
@@ -176,33 +192,25 @@ class LidarData:
         self.ax.grid(True)
 
         # Khởi tạo global map (occupancy grid)
-        self.map_size_mm = 10000  # Kích thước map toàn cục (10m x 10m)
+        self.map_size_mm = 10000  # mm, tức là 10m x 10m
         self.global_map_dim = int(self.map_size_mm / self.GRID_SIZE)
-        # Khởi tạo với giá trị 127 (unknown); giá trị 0: free, 255: occupied
         self.global_map = np.full((self.global_map_dim, self.global_map_dim), 127, dtype=np.uint8)
 
         self.pose_lock = threading.Lock()
-        # Kết nối ban đầu
         if not self._connect_wifi():
             logging.error("Kết nối ban đầu không thành công. Vui lòng nhập IP ESP32 thủ công qua giao diện.")
         else:
             self.send_command("RESET_ENCODERS")
             logging.info("Đã gửi lệnh reset encoders")
 
-        # Khởi tạo các thread xử lý lệnh và dữ liệu
         self.command_thread = threading.Thread(target=self._handle_commands, daemon=True)
         self.command_thread.start()
         self.process_thread = threading.Thread(target=self.process_data, daemon=True)
         self.process_thread.start()
 
     def set_heading(self, theta):
-        """
-        Chỉ cập nhật góc theta (rad), giữ nguyên x, y và bản đồ.
-        """
         with self.pose_lock:
-            # chỉ set theta
             self.pose_theta = theta
-            # nếu đã khởi tạo EKF, cập nhật luôn state[2]
             if hasattr(self, 'ekf_slam'):
                 self.ekf_slam.state[2] = theta
         logging.info(f"Heading adjusted to θ={theta:.3f} rad")
@@ -252,7 +260,7 @@ class LidarData:
         return x_coords.tolist(), y_coords.tolist()
 
     def _to_global_coordinates(self, angles, distances):
-        angles_np = np.array(angles) + self.heading_offset  # Thêm offset vào góc
+        angles_np = np.array(angles) + self.heading_offset
         distances_np = np.array(distances)
         global_x = self.pose_x + distances_np * np.cos(self.pose_theta + angles_np)
         global_y = self.pose_y + distances_np * np.sin(self.pose_theta + angles_np)
@@ -300,23 +308,16 @@ class LidarData:
     # Cập nhật global map bằng thuật toán map merging
     # --------------------------
     def update_global_map(self, scan_x, scan_y):
-        """
-        Cập nhật global_map từ các điểm quét (scan_x, scan_y) với tọa độ toàn cục (mm).
-        Sử dụng thuật toán Bresenham để xác định các ô “free” theo đường ray từ vị trí robot đến điểm đo.
-        """
-        # Chuyển vị trí robot (mm) sang chỉ số lưới global map
         robot_grid_x = int((self.pose_x + self.map_size_mm/2) / self.GRID_SIZE)
         robot_grid_y = int((self.pose_y + self.map_size_mm/2) / self.GRID_SIZE)
         for x, y in zip(scan_x, scan_y):
             meas_grid_x = int((x + self.map_size_mm/2) / self.GRID_SIZE)
             meas_grid_y = int((y + self.map_size_mm/2) / self.GRID_SIZE)
             line_cells = bresenham_line(robot_grid_x, robot_grid_y, meas_grid_x, meas_grid_y)
-            # Cập nhật các ô dọc theo đường ray là free (trừ ô cuối cùng)
             for cell in line_cells[:-1]:
                 cx, cy = cell
                 if 0 <= cx < self.global_map_dim and 0 <= cy < self.global_map_dim:
                     self.global_map[cy, cx] = 0
-            # Ô cuối cùng đánh dấu là occupied
             if 0 <= meas_grid_x < self.global_map_dim and 0 <= meas_grid_y < self.global_map_dim:
                 self.global_map[meas_grid_y, meas_grid_x] = 255
 
@@ -324,20 +325,15 @@ class LidarData:
         angles, distances = self._filter_data(self.data['angles'], self.data['distances'])
         if not angles:
             return
-
         global_x_coords, global_y_coords = self._to_global_coordinates(angles, distances)
         filtered_x, filtered_y = self._remove_outliers(global_x_coords, global_y_coords)
         downsampled_x, downsampled_y = self.voxel_downsample(filtered_x, filtered_y, voxel_size=self.GRID_SIZE)
-
         with self.data_lock:
             self.data['x_coords'].extend(downsampled_x)
             self.data['y_coords'].extend(downsampled_y)
             self.data['angles'].clear()
             self.data['distances'].clear()
-
-        # Cập nhật global map từ các điểm quét mới
         self.update_global_map(downsampled_x, downsampled_y)
-
         self.ax.clear()
         extent = (-self.map_size_mm/2, self.map_size_mm/2, -self.map_size_mm/2, self.map_size_mm/2)
         self.ax.imshow(self.global_map, cmap='gray', origin='lower', extent=extent)
@@ -382,83 +378,64 @@ class LidarData:
                 logging.error("Exception in update_data: %s", e)
                 self.sock = None
                 continue
-
             while '\n' in buffer:
                 line, buffer = buffer.split('\n', 1)
                 logging.debug("Raw data received: %s", line)
                 sensor_data = line.strip().split('\t')
-                if len(sensor_data) != 10:  # Cập nhật từ 9 lên 10 vì thêm gyroZ
+                if len(sensor_data) != 10:
                     logging.warning("Sensor data length mismatch: %s", sensor_data)
                     continue
-
                 try:
                     base_angle = int(sensor_data[0])
                     speed = int(sensor_data[1])
                     distances = np.array(sensor_data[2:6], dtype=float)
                     encoder_count = int(sensor_data[7].strip())
                     encoder_count2 = int(sensor_data[8].strip())
-                    gyro_z = float(sensor_data[9].strip())  # Giá trị vận tốc góc từ MPU6050
+                    gyro_z = float(sensor_data[9].strip())
                     logging.info("Raw data: encoder_count=%d, encoder_count2=%d, gyroZ=%.2f rad/s",
                                  encoder_count, encoder_count2, gyro_z)
                 except ValueError as e:
                     logging.error("Error parsing sensor data %s: %s", sensor_data, e)
                     continue
-
-                # --- Xử lý odometry ---
                 if self.last_encoder_left is None:
                     self.last_encoder_left = encoder_count
                     self.last_encoder_right = encoder_count2
                     self.initial_encoder_left = encoder_count
                     self.initial_encoder_right = encoder_count2
                     self.robot_distance = 0.0
-                    self.last_time = time.time()  # Thêm thời gian để tính delta_t
+                    self.last_time = time.time()
                     logging.info("Initialized encoders: left=%d, right=%d", encoder_count, encoder_count2)
                 else:
                     current_time = time.time()
-                    delta_t = current_time - self.last_time  # Thời gian giữa hai lần đo (giây)
+                    delta_t = current_time - self.last_time
                     self.last_time = current_time
-
-                    delta_left = (encoder_count - self.last_encoder_left) * self.wheel_circumference / self.ppr  # mm
-                    delta_right = (encoder_count2 - self.last_encoder_right) * self.wheel_circumference / self.ppr  # mm
-                    delta_s = (delta_left + delta_right) / 2.0  # mm
-                    delta_theta_enc = (delta_right - delta_left) / self.wheel_base  # radian từ encoder
-
-                    # Tính delta_theta_gyro mà không cần chuyển đổi deg/s sang radian
-                    delta_theta_gyro = gyro_z * delta_t  # radian
-
-                    # Kết hợp delta_theta từ encoder và MPU6050 (có thể dùng trọng số đơn giản)
+                    delta_left = (encoder_count - self.last_encoder_left) * self.wheel_circumference / self.ppr
+                    delta_right = (encoder_count2 - self.last_encoder_right) * self.wheel_circumference / self.ppr
+                    delta_s = (delta_left + delta_right) / 2.0
+                    delta_theta_enc = (delta_right - delta_left) / self.wheel_base
+                    delta_theta_gyro = gyro_z * delta_t
                     delta_theta = 1 * delta_theta_gyro + 0 * delta_theta_enc
-
                     logging.debug("Encoder: left=%d, right=%d, delta_left=%.2f mm, delta_right=%.2f mm",
                                   encoder_count, encoder_count2, delta_left, delta_right)
                     logging.debug("Odometry: delta_s=%.2f mm, delta_theta_enc=%.4f rad, delta_theta_gyro=%.4f rad",
                                   delta_s, delta_theta_enc, delta_theta_gyro)
-
-                    # --- EKF SLAM Prediction ---
                     if not hasattr(self, 'ekf_slam'):
                         self.ekf_slam = EKFSLAM([self.pose_x, self.pose_y, self.pose_theta])
                     motion_cov = np.diag([1e-1, 1e-1, 1e-2])
                     self.ekf_slam.predict(delta_s, delta_theta, motion_cov)
-
-                    # Cập nhật pose từ EKF
                     self.pose_x, self.pose_y, self.pose_theta = self.ekf_slam.state
                     logging.info("Pose updated (EKF): x=%.2f mm, y=%.2f mm, theta=%.4f rad",
                                  self.pose_x, self.pose_y, self.pose_theta)
-
                     self.last_encoder_left = encoder_count
                     self.last_encoder_right = encoder_count2
-
                 self.robot_distance = (((encoder_count - self.initial_encoder_left) +
                                         (encoder_count2 - self.initial_encoder_right)) / 2
                                        * self.wheel_circumference / self.ppr)
                 logging.info("Total distance traveled: %.2f mm", self.robot_distance)
-
-                # --- Xử lý dữ liệu LiDAR ---
                 angles = (np.arange(4) + base_angle) * (pi / 180)
                 valid_mask = (distances >= self.MIN_DISTANCE) & (distances <= self.MAX_DISTANCE)
                 valid_angles = angles[valid_mask]
                 valid_distances = distances[valid_mask]
-
                 if valid_angles.size > 0:
                     if not hasattr(self, 'ekf_slam'):
                         self.ekf_slam = EKFSLAM([self.pose_x, self.pose_y, self.pose_theta])
@@ -470,7 +447,6 @@ class LidarData:
                     landmark_pos = np.array([lx, ly])
                     measurement_cov = np.diag([1e-3, 1e-4])
                     self.ekf_slam.update(z, landmark_pos, measurement_cov)
-
                 with self.data_lock:
                     self.data['angles'].extend(valid_angles.tolist())
                     self.data['distances'].extend(valid_distances.tolist())
@@ -488,18 +464,15 @@ class LidarData:
         self.command_queue.put(command)
 
     def move(self, distance_m):
-        """
-        Gửi lệnh di chuyển thẳng D (mét).
-        """
         cmd = f"MOVE {distance_m}"
         self.send_command(cmd)
         logging.info("Move command sent: %s", cmd)
 
-    def rotate(self, angle_deg):
+    def rotate(self, angle_rad):
         """
-        Gửi lệnh xoay tại chỗ θ (độ).
+        Gửi lệnh xoay tại chỗ với góc được tính theo radian.
         """
-        cmd = f"ROTATE {angle_deg}"
+        cmd = f"ROTATE {angle_rad}"
         self.send_command(cmd)
         logging.info("Rotate command sent: %s", cmd)
 
@@ -531,13 +504,42 @@ class LidarData:
         logging.info("Plot closed.")
 
     def reset_map(self):
-        # Đặt lại bản đồ toàn cục về trạng thái ban đầu (giá trị 127 - unknown)
         self.global_map = np.full((self.global_map_dim, self.global_map_dim), 127, dtype=np.uint8)
-        # Xóa các tọa độ đã lưu (nếu cần)
         with self.data_lock:
             self.data['x_coords'].clear()
             self.data['y_coords'].clear()
-        print("Đã xóa bản đồ.")  # Thay logging.info nếu không dùng logging
+        print("Đã xóa bản đồ.")
+
+    # --- HÀM NAVIGATE_TO_TARGET ĐƯỢC THÊM VÀO LỚP ---
+    def navigate_to_target(self, target_x, target_y):
+        """
+        Tính toán đường đi từ vị trí hiện tại đến điểm đích (target_x, target_y) và điều khiển robot.
+        target_x, target_y: tọa độ điểm đích (mm) trong hệ tọa độ toàn cục.
+        """
+        grid_target = (int((target_x + self.map_size_mm / 2) / self.GRID_SIZE),
+                       int((target_y + self.map_size_mm / 2) / self.GRID_SIZE))
+        grid_start = (int((self.pose_x + self.map_size_mm / 2) / self.GRID_SIZE),
+                      int((self.pose_y + self.map_size_mm / 2) / self.GRID_SIZE))
+        path = a_star_search(self.global_map, grid_start, grid_target)
+        if not path:
+            print("Không tìm được đường đi đến đích!")
+            return
+        print("Đường đi đã tính được:", path)
+        for cell in path:
+            waypoint_x = cell[0] * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2
+            waypoint_y = cell[1] * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2
+            desired_angle = atan2(waypoint_y - self.pose_y, waypoint_x - self.pose_x)
+            angle_diff = desired_angle - self.pose_theta
+            angle_diff = atan2(sin(angle_diff), cos(angle_diff))
+            print(f"Di chuyển đến waypoint tại ({waypoint_x:.1f}, {waypoint_y:.1f}); cần xoay {angle_diff:.3f} rad")
+            # Gọi lệnh xoay với giá trị radian trực tiếp
+            self.rotate(angle_diff)
+            time.sleep(0.5)
+            distance = sqrt((waypoint_x - self.pose_x) ** 2 + (waypoint_y - self.pose_y) ** 2)
+            print(f"Tiến hành di chuyển khoảng cách {distance:.1f} mm")
+            self.move(distance / 1000)
+            time.sleep(1)
+        print("Đã hoàn thành di chuyển đến vị trí đích")
 
 
 # ------------------------------
@@ -547,7 +549,6 @@ if __name__ == "__main__":
     lidar = LidarData(host='192.168.0.133', port=80, neighbor_radius=50, min_neighbors=5)
     data_thread = threading.Thread(target=lidar.update_data, daemon=True)
     data_thread.start()
-
     app = QApplication(sys.argv)
     window = LidarWindow(lidar)
     window.show()

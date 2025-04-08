@@ -1,9 +1,7 @@
-from PyQt5.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit, QSlider
+from PyQt5.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit, QSlider, QMessageBox
 from PyQt5.QtCore import QTimer, Qt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from math import pi
-from PyQt5.QtWidgets import QMessageBox
-
 
 class LidarWindow(QMainWindow):
     def __init__(self, lidar):
@@ -14,7 +12,6 @@ class LidarWindow(QMainWindow):
     def initUI(self):
         self.setWindowTitle("Robot Control with Lidar Mapping")
         self.setGeometry(100, 100, 800, 600)
-        # Đảm bảo cửa sổ nhận được sự kiện bàn phím
         self.setFocusPolicy(Qt.StrongFocus)
 
         # Tạo widget trung tâm và layout chính
@@ -42,16 +39,16 @@ class LidarWindow(QMainWindow):
         offset_layout = QHBoxLayout()
         self.offset_label = QLabel("Heading Offset (degrees):")
         self.offset_slider = QSlider(Qt.Horizontal)
-        self.offset_slider.setRange(-180, 180)  # Phạm vi từ -180 đến 180 độ
-        self.offset_slider.setValue(0)  # Giá trị mặc định là 0
-        self.offset_value_label = QLabel("0")  # Hiển thị giá trị hiện tại
-        self.offset_slider.valueChanged.connect(self.change_offset)  # Kết nối sự kiện
+        self.offset_slider.setRange(-180, 180)
+        self.offset_slider.setValue(0)
+        self.offset_value_label = QLabel("0")
+        self.offset_slider.valueChanged.connect(self.change_offset)
         offset_layout.addWidget(self.offset_label)
         offset_layout.addWidget(self.offset_slider)
         offset_layout.addWidget(self.offset_value_label)
         vbox.addLayout(offset_layout)
 
-        # ── Layout cho chỉnh hướng ban đầu ──
+        # Layout cho chỉnh hướng ban đầu
         heading_layout = QHBoxLayout()
         self.heading_input = QLineEdit()
         self.heading_input.setPlaceholderText("Θ (deg)")
@@ -62,12 +59,12 @@ class LidarWindow(QMainWindow):
         heading_layout.addWidget(self.set_heading_btn)
         vbox.addLayout(heading_layout)
 
-        # Layout cho thanh trượt điều khiển tốc độ (PWM 0-255)
+        # Layout cho thanh trượt điều khiển tốc độ
         speed_layout = QHBoxLayout()
         self.speed_label = QLabel("Speed:")
         self.speed_slider = QSlider(Qt.Horizontal)
         self.speed_slider.setRange(0, 255)
-        self.speed_slider.setValue(128)  # Giá trị mặc định
+        self.speed_slider.setValue(128)
         self.speed_value_label = QLabel("128")
         self.speed_slider.valueChanged.connect(self.change_speed)
         speed_layout.addWidget(self.speed_label)
@@ -80,24 +77,25 @@ class LidarWindow(QMainWindow):
         self.forward_btn = QPushButton("Tiến")
         self.forward_btn.pressed.connect(lambda: self.lidar.send_command("forward"))
         self.forward_btn.released.connect(lambda: self.lidar.send_command("stop"))
-
         self.backward_btn = QPushButton("Lùi")
         self.backward_btn.pressed.connect(lambda: self.lidar.send_command("reverse"))
         self.backward_btn.released.connect(lambda: self.lidar.send_command("stop"))
-
-        # Nút xoay trái
         self.left_btn = QPushButton("Xoay trái")
         self.left_btn.pressed.connect(lambda: self.lidar.send_command("left"))
         self.left_btn.released.connect(lambda: self.lidar.send_command("stop"))
-
-        # Nút xoay phải
         self.right_btn = QPushButton("Xoay phải")
         self.right_btn.pressed.connect(lambda: self.lidar.send_command("right"))
         self.right_btn.released.connect(lambda: self.lidar.send_command("stop"))
+        self.status_label = QLabel("Robot Distance: 0.00 cm")
+        btn_layout.addWidget(self.forward_btn)
+        btn_layout.addWidget(self.backward_btn)
+        btn_layout.addWidget(self.left_btn)
+        btn_layout.addWidget(self.right_btn)
+        btn_layout.addWidget(self.status_label)
+        vbox.addLayout(btn_layout)
 
-        # ── ADD: Layout MOVE / ROTATE ──
+        # Layout MOVE / ROTATE
         mr_layout = QHBoxLayout()
-        # MOVE
         mr_layout.addWidget(QLabel("Move (m):"))
         self.move_input = QLineEdit()
         self.move_input.setPlaceholderText("ví dụ 1.2")
@@ -106,7 +104,6 @@ class LidarWindow(QMainWindow):
         self.move_btn.clicked.connect(self.on_move)
         mr_layout.addWidget(self.move_btn)
         mr_layout.addSpacing(20)
-        # ROTATE
         mr_layout.addWidget(QLabel("Rotate (°):"))
         self.rotate_input = QLineEdit()
         self.rotate_input.setPlaceholderText("ví dụ -90")
@@ -116,24 +113,44 @@ class LidarWindow(QMainWindow):
         mr_layout.addWidget(self.rotate_btn)
         vbox.addLayout(mr_layout)
 
-        # Nhãn hiển thị quãng đường đã đi (cm)
-        self.status_label = QLabel("Robot Distance: 0.00 cm")
-        btn_layout.addWidget(self.forward_btn)
-        btn_layout.addWidget(self.backward_btn)
-        btn_layout.addWidget(self.left_btn)
-        btn_layout.addWidget(self.right_btn)
-        btn_layout.addWidget(self.status_label)
-        vbox.addLayout(btn_layout)
+        # Thêm giao diện điều hướng (navigation UI)
+        self.init_navigation_ui(vbox)
 
-        # QTimer để cập nhật giao diện định kỳ (mỗi 100ms)
+        # QTimer để cập nhật giao diện định kỳ
         self.timer = QTimer()
         self.timer.setInterval(100)
         self.timer.timeout.connect(self.update_gui)
         self.timer.start()
 
+    def init_navigation_ui(self, vbox):
+        # Tạo layout cho điều khiển di chuyển đến tọa độ
+        nav_layout = QHBoxLayout()
+        nav_layout.addWidget(QLabel("Target X (mm):"))
+        self.target_x_edit = QLineEdit()
+        self.target_x_edit.setPlaceholderText("Nhập target X (mm)")
+        nav_layout.addWidget(self.target_x_edit)
+        nav_layout.addWidget(QLabel("Target Y (mm):"))
+        self.target_y_edit = QLineEdit()
+        self.target_y_edit.setPlaceholderText("Nhập target Y (mm)")
+        nav_layout.addWidget(self.target_y_edit)
+        self.navigate_button = QPushButton("Di chuyển đến vị trí")
+        self.navigate_button.clicked.connect(self.on_navigate_button_clicked)
+        nav_layout.addWidget(self.navigate_button)
+        vbox.addLayout(nav_layout)
+
+    def on_navigate_button_clicked(self):
+        try:
+            target_x = float(self.target_x_edit.text())
+            target_y = float(self.target_y_edit.text())
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Input", "Vui lòng nhập số hợp lệ cho tọa độ!")
+            return
+        # Gọi hàm điều hướng có trong lidar_instance
+        self.lidar.navigate_to_target(target_x, target_y)
+        self.status_label.setText(f"Navigating to: ({target_x:.2f}, {target_y:.2f}) mm")
+
     def change_speed(self, value):
         self.speed_value_label.setText(str(value))
-        # Gửi lệnh cập nhật tốc độ đến ESP32, ví dụ: "set_speed 128"
         command = f"set_speed {value}"
         self.lidar.send_command(command)
 
@@ -147,23 +164,16 @@ class LidarWindow(QMainWindow):
                 self.status_label.setText("Kết nối thất bại. Kiểm tra lại địa chỉ IP.")
 
     def update_gui(self):
-        # Cập nhật bản đồ nếu có dữ liệu mới
         if not self.lidar.plot_queue.empty():
             while not self.lidar.plot_queue.empty():
                 self.lidar.plot_queue.get()
             self.lidar._plot_map()
             self.canvas.draw()
-        # Cập nhật nhãn trạng thái với quãng đường đi
         self.status_label.setText(f"Robot Distance: {self.lidar.robot_distance:.2f} cm")
 
-    # ---------------------------
-    # Xử lý sự kiện bàn phím để điều khiển xe
-    # ---------------------------
     def keyPressEvent(self, event):
-        # Bỏ qua các sự kiện lặp tự động
         if event.isAutoRepeat():
             return super().keyPressEvent(event)
-
         key = event.key()
         if key == Qt.Key_Up:
             self.lidar.send_command("forward")
@@ -177,10 +187,8 @@ class LidarWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event):
-        # Bỏ qua các sự kiện lặp tự động
         if event.isAutoRepeat():
             return super().keyReleaseEvent(event)
-
         key = event.key()
         if key in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right):
             self.lidar.send_command("stop")
@@ -194,7 +202,6 @@ class LidarWindow(QMainWindow):
         except ValueError:
             QMessageBox.warning(self, "Invalid Input", "Distance phải là số (m) hợp lệ!")
             return
-        # gửi lệnh MOVE D
         cmd = f"MOVE {d}"
         self.lidar.send_command(cmd)
         self.status_label.setText(f"Sent: {cmd}")
@@ -206,11 +213,9 @@ class LidarWindow(QMainWindow):
         except ValueError:
             QMessageBox.warning(self, "Invalid Input", "Angle phải là số (°) hợp lệ!")
             return
-        # Chuyển độ → radian
         rad = deg * pi / 180.0
         cmd = f"ROTATE {rad}"
         self.lidar.send_command(cmd)
-        # Cập nhật status (nếu muốn hiển thị thêm độ)
         self.status_label.setText(f"Sent: ROTATE {deg:.1f}° → {rad:.3f}rad")
 
     def closeEvent(self, event):
@@ -218,39 +223,23 @@ class LidarWindow(QMainWindow):
         event.accept()
 
     def on_set_heading(self):
-        # 1) Đọc giá trị góc từ input
         try:
             theta_deg = float(self.heading_input.text())
         except ValueError:
-            QMessageBox.warning(self, "Invalid Input",
-                                "Θ phải là số (độ) hợp lệ!")
+            QMessageBox.warning(self, "Invalid Input", "Θ phải là số (độ) hợp lệ!")
             return
-
-        # 2) Chuyển sang radian
         theta = theta_deg * pi / 180
-
-        # 3) Gọi backend và bắt lỗi
         try:
             self.lidar.set_heading(theta)
         except Exception as e:
-            QMessageBox.critical(self, "Error Setting Heading",
-                                 f"Không thể điều chỉnh hướng:\n{e}")
+            QMessageBox.critical(self, "Error Setting Heading", f"Không thể điều chỉnh hướng:\n{e}")
             return
-
-        # 4) Cập nhật status
         self.status_label.setText(f"Hướng đã chỉnh: θ={theta_deg:.1f}°")
 
     def change_offset(self, value):
-        # Cập nhật nhãn hiển thị giá trị offset
         self.offset_value_label.setText(str(value))
-
-        # Chuyển đổi offset từ độ sang radian
-        offset_rad = value * (3.14159 / 180)  # Dùng 3.14159 thay pi nếu không import math
-
-        # Gán offset mới cho đối tượng LidarData
+        offset_rad = value * (pi / 180)
         self.lidar.heading_offset = offset_rad
-
-        # Xóa bản đồ cũ và vẽ lại
-        self.lidar.reset_map()  # Gọi hàm xóa bản đồ
-        self.lidar._plot_map()  # Vẽ lại bản đồ với dữ liệu mới
-        self.canvas.draw()  # Cập nhật giao diện
+        self.lidar.reset_map()
+        self.lidar._plot_map()
+        self.canvas.draw()

@@ -31,33 +31,32 @@ def a_star_search(grid, start, goal):
         current_priority, current = heapq.heappop(open_set)
         if current == goal:
             break
-
-        # Lấy các ô láng giềng theo 4 hướng (trên, dưới, trái, phải)
-        neighbors = [(current[0]-1, current[1]), (current[0]+1, current[1]),
-                     (current[0], current[1]-1), (current[0], current[1]+1)]
+        x, y = current
+        # 8 hướng di chuyển
+        neighbors = [(x-1, y), (x+1, y), (x, y-1), (x, y+1),
+                     (x-1, y-1), (x-1, y+1), (x+1, y-1), (x+1, y+1)]
         for next in neighbors:
-            if (0 <= next[0] < cols and 0 <= next[1] < rows and
-                grid[next[1], next[0]] != 255):  # Cho phép các ô unknown (127) và free (0)
-                new_cost = cost_so_far[current] + 1
+            nx, ny = next
+            if 0 <= nx < cols and 0 <= ny < rows and grid[ny, nx] != 255:
+                # Sử dụng √2 cho bước chéo, 1 cho bước ngang/dọc
+                step_cost = sqrt(2) if (nx - x != 0 and ny - y != 0) else 1
+                new_cost = cost_so_far[current] + step_cost
                 if next not in cost_so_far or new_cost < cost_so_far[next]:
                     cost_so_far[next] = new_cost
                     priority = new_cost + heuristic(goal, next)
                     heapq.heappush(open_set, (priority, next))
                     came_from[next] = current
 
-    # Xây dựng đường đi nếu có
     path = []
     current = goal
     while current != start:
         path.append(current)
         current = came_from.get(current)
         if current is None:
-            # Nếu không tìm được đường đi, trả về danh sách rỗng
-            return []
+            return []  # Không tìm được đường đi
     path.append(start)
     path.reverse()
     return path
-
 
 # ------------------------------
 # Hàm Bresenham cho việc tìm các ô trong grid theo đường ray
@@ -591,12 +590,11 @@ class LidarData:
             time.sleep(max(2, distance / 100)+2)  # Đợi dựa trên khoảng cách (giả sử tốc độ 100 mm/s)
         print("Đã hoàn thành di chuyển đến vị trí đích")
 
-
 # ------------------------------
 # Chương trình chính
 # ------------------------------
 if __name__ == "__main__":
-    lidar = LidarData(host='192.168.0.133', port=80, neighbor_radius=50, min_neighbors=5)
+    lidar = LidarData(host='192.168.0.134', port=80, neighbor_radius=50, min_neighbors=5)
     data_thread = threading.Thread(target=lidar.update_data, daemon=True)
     data_thread.start()
     app = QApplication(sys.argv)

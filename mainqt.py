@@ -199,6 +199,13 @@ class LidarData:
         self.data_event = threading.Event()
         self.running = True
 
+        # Các thuộc tính khác
+        self.pose_x = 0.0
+        self.pose_y = 0.0
+        self.pose_theta = 0.0
+        # Khởi tạo ekf_slam ngay từ đầu
+        self.ekf_slam = EKFSLAM([self.pose_x, self.pose_y, self.pose_theta])
+
         # Thông số encoder
         self.wheel_diameter = 70  # mm
         self.ppr = 500            # pulses per revolution
@@ -466,16 +473,15 @@ class LidarData:
                 valid_angles = angles[valid_mask]
                 valid_distances = distances[valid_mask]
                 if valid_angles.size > 0:
-                    if not hasattr(self, 'ekf_slam'):
-                        self.ekf_slam = EKFSLAM([self.pose_x, self.pose_y, self.pose_theta])
-                    meas_range = valid_distances[0]
-                    meas_bearing = valid_angles[0] - self.pose_theta
-                    z = np.array([meas_range, meas_bearing])
-                    lx = self.ekf_slam.state[0] + meas_range * cos(self.ekf_slam.state[2] + meas_bearing)
-                    ly = self.ekf_slam.state[1] + meas_range * sin(self.ekf_slam.state[2] + meas_bearing)
-                    landmark_pos = np.array([lx, ly])
-                    measurement_cov = np.diag([1e-3, 1e-4])
-                    self.ekf_slam.update(z, landmark_pos, measurement_cov)
+                    for i in range(len(valid_angles)):
+                        meas_range = valid_distances[i]
+                        meas_bearing = valid_angles[i] - self.pose_theta
+                        z = np.array([meas_range, meas_bearing])
+                        lx = self.ekf_slam.state[0] + meas_range * cos(self.ekf_slam.state[2] + meas_bearing)
+                        ly = self.ekf_slam.state[1] + meas_range * sin(self.ekf_slam.state[2] + meas_bearing)
+                        landmark_pos = np.array([lx, ly])
+                        measurement_cov = np.diag([1e-3, 1e-4])
+                        self.ekf_slam.update(z, landmark_pos, measurement_cov)
                 with self.data_lock:
                     self.data['angles'].extend(valid_angles.tolist())
                     self.data['distances'].extend(valid_distances.tolist())
@@ -493,18 +499,47 @@ class LidarData:
         self.command_queue.put(command)
 
     def move(self, distance_m):
+        # Lưu lại vị trí ban đầu (đơn vị mm)
+        initial_x, initial_y = self.pose_x, self.pose_y
+        # Gửi lệnh di chuyển với đơn vị là mét
         cmd = f"MOVE {distance_m}"
         self.send_command(cmd)
-        logging.info("Move command sent: %s", cmd)
+
+        tolerance = 0.02  # cho phép sai số 2cm
+        start_time = time.time()
+        timeout = 10  # thời gian tối đa chờ là 10 giây
+
+        while True:
+            # Chuyển đổi khoảng cách đã đi từ mm sang m để so sánh
+            current_distance_m = sqrt((self.pose_x - initial_x) ** 2 + (self.pose_y - initial_y) ** 2) / 1000.0
+            if current_distance_m >= distance_m - tolerance:
+                break
+            if time.time() - start_time > timeout:
+                print("Timeout khi di chuyển!")
+                break
+            time.sleep(0.1)
 
     def rotate(self, angle_rad):
-        """
-        Gửi lệnh xoay tại chỗ với góc được tính theo radian.
-        """
+        # Tính góc mục tiêu theo radian dựa trên odometry hiện tại
+        target_theta = self.pose_theta + angle_rad
+        target_theta = atan2(sin(target_theta), cos(target_theta))
+        tolerance = 0.1  # cho phép sai số 0.1 rad
+        # Gửi lệnh quay với đơn vị radian
         cmd = f"ROTATE {angle_rad}"
         self.send_command(cmd)
-        logging.info("Rotate command sent: %s", cmd)
 
+        start_time = time.time()
+        timeout = 10  # timeout 10 giây
+
+        while True:
+            # Tính sai số góc hiện tại (radian)
+            error = abs(atan2(sin(self.pose_theta - target_theta), cos(self.pose_theta - target_theta)))
+            if error < tolerance:
+                break
+            if time.time() - start_time > timeout:
+                print("Timeout khi quay!")
+                break
+            time.sleep(0.1)
     def _handle_commands(self):
         while self.running:
             try:
@@ -541,11 +576,7 @@ class LidarData:
 
     # --- HÀM NAVIGATE_TO_TARGET ĐƯỢC THÊM VÀO LỚP ---
     def navigate_to_target(self, target_x, target_y):
-        """
-        Tính toán đường đi từ vị trí hiện tại đến điểm đích (target_x, target_y) và điều khiển robot.
-        target_x, target_y: tọa độ điểm đích (mm) trong hệ tọa độ toàn cục.
-        """
-        # Chuyển đổi tọa độ thực sang chỉ số lưới
+        # Tính tọa độ đích trên lưới (grid)
         grid_target = (int((target_x + self.map_size_mm / 2) / self.GRID_SIZE),
                        int((target_y + self.map_size_mm / 2) / self.GRID_SIZE))
         grid_start = (int((self.pose_x + self.map_size_mm / 2) / self.GRID_SIZE),
@@ -554,47 +585,36 @@ class LidarData:
         if not path:
             print("Không tìm được đường đi đến đích!")
             return
-        print("Đường đi ban đầu:", path)
 
-        # Thực hiện tối ưu (smoothing) đường đi
         smooth_waypoints = smooth_path(path, self.global_map)
-        if len(smooth_waypoints) <= 1:
-            print("Đường đi sau smoothing chỉ có điểm hiện tại, không có lộ trình di chuyển!")
-            return
-        print("Đường đi sau khi làm mượt:", smooth_waypoints)
+        # Chuyển đổi tọa độ grid về tọa độ thực (mm)
+        waypoints_x = [cell[0] * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2 for cell in
+                       smooth_waypoints]
+        waypoints_y = [cell[1] * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2 for cell in
+                       smooth_waypoints]
 
-        # Chuyển đổi các cell sang tọa độ thực (mm)
-        waypoints_x = []
-        waypoints_y = []
-        for cell in smooth_waypoints:
-            wx = cell[0] * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2
-            wy = cell[1] * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2
-            waypoints_x.append(wx)
-            waypoints_y.append(wy)
-
-        # Hiển thị các waypoint sau khi làm mượt lên bản đồ
+        # Vẽ các waypoint lên bản đồ để theo dõi
         self.ax.plot(waypoints_x, waypoints_y, 'bo-', markersize=5, label='Smoothed Waypoints')
         self.ax.legend()
         self.fig.canvas.draw()
 
-        # Điều khiển robot theo các waypoint mượt
+        # Di chuyển qua từng waypoint
         for wx, wy in zip(waypoints_x, waypoints_y):
             desired_angle = atan2(wy - self.pose_y, wx - self.pose_x)
             angle_diff = desired_angle - self.pose_theta
             angle_diff = atan2(sin(angle_diff), cos(angle_diff))
             print(f"Di chuyển đến waypoint tại ({wx:.1f}, {wy:.1f}); cần xoay {angle_diff:.3f} rad")
             self.rotate(angle_diff)
-            time.sleep(3)  # Đợi 2 giây để hoàn thành xoay
+            # Tính khoảng cách cần di chuyển (đã ở mm)
             distance = sqrt((wx - self.pose_x) ** 2 + (wy - self.pose_y) ** 2)
+            # Chuyển khoảng cách từ mm sang mét trước khi gọi move
             self.move(distance / 1000)
-            time.sleep(max(2, distance / 100)+2)  # Đợi dựa trên khoảng cách (giả sử tốc độ 100 mm/s)
         print("Đã hoàn thành di chuyển đến vị trí đích")
-
 # ------------------------------
 # Chương trình chính
 # ------------------------------
 if __name__ == "__main__":
-    lidar = LidarData(host='192.168.0.134', port=80, neighbor_radius=50, min_neighbors=5)
+    lidar = LidarData(host='192.168.0.112', port=80, neighbor_radius=30, min_neighbors=7)
     data_thread = threading.Thread(target=lidar.update_data, daemon=True)
     data_thread.start()
     app = QApplication(sys.argv)

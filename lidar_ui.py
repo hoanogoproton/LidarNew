@@ -145,8 +145,10 @@ class LidarWindow(QMainWindow):
         except ValueError:
             QMessageBox.warning(self, "Invalid Input", "Vui lòng nhập số hợp lệ cho tọa độ!")
             return
-        # Gọi hàm điều hướng có trong lidar_instance
-        self.lidar.navigate_to_target(target_x, target_y)
+        # Khởi chạy quá trình điều hướng trên thread riêng để không làm chặn các tác vụ khác (Lidar, SLAM...)
+        import threading
+        nav_thread = threading.Thread(target=self.lidar.navigate_to_target, args=(target_x, target_y), daemon=True)
+        nav_thread.start()
         self.status_label.setText(f"Navigating to: ({target_x:.2f}, {target_y:.2f}) mm")
 
     def change_speed(self, value):

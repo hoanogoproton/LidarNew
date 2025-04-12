@@ -16,6 +16,10 @@ from lidar_ui import LidarWindow  # Nhập giao diện từ file lidar_ui.py
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
+def start_navigation(lidar, target_x, target_y):
+    nav_thread = threading.Thread(target=lidar.navigate_to_target, args=(target_x, target_y), daemon=True)
+    nav_thread.start()
+
 def heuristic(a, b):
     # Sử dụng khoảng cách Euclid
     return sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
@@ -498,48 +502,6 @@ class LidarData:
     def send_command(self, command):
         self.command_queue.put(command)
 
-    def move(self, distance_m):
-        # Lưu lại vị trí ban đầu (đơn vị mm)
-        initial_x, initial_y = self.pose_x, self.pose_y
-        # Gửi lệnh di chuyển với đơn vị là mét
-        cmd = f"MOVE {distance_m}"
-        self.send_command(cmd)
-
-        tolerance = 0.02  # cho phép sai số 2cm
-        start_time = time.time()
-        timeout = 10  # thời gian tối đa chờ là 10 giây
-
-        while True:
-            # Chuyển đổi khoảng cách đã đi từ mm sang m để so sánh
-            current_distance_m = sqrt((self.pose_x - initial_x) ** 2 + (self.pose_y - initial_y) ** 2) / 1000.0
-            if current_distance_m >= distance_m - tolerance:
-                break
-            if time.time() - start_time > timeout:
-                print("Timeout khi di chuyển!")
-                break
-            time.sleep(0.1)
-
-    def rotate(self, angle_rad):
-        # Tính góc mục tiêu theo radian dựa trên odometry hiện tại
-        target_theta = self.pose_theta + angle_rad
-        target_theta = atan2(sin(target_theta), cos(target_theta))
-        tolerance = 0.1  # cho phép sai số 0.1 rad
-        # Gửi lệnh quay với đơn vị radian
-        cmd = f"ROTATE {angle_rad}"
-        self.send_command(cmd)
-
-        start_time = time.time()
-        timeout = 10  # timeout 10 giây
-
-        while True:
-            # Tính sai số góc hiện tại (radian)
-            error = abs(atan2(sin(self.pose_theta - target_theta), cos(self.pose_theta - target_theta)))
-            if error < tolerance:
-                break
-            if time.time() - start_time > timeout:
-                print("Timeout khi quay!")
-                break
-            time.sleep(0.1)
     def _handle_commands(self):
         while self.running:
             try:
@@ -574,9 +536,58 @@ class LidarData:
             self.data['y_coords'].clear()
         print("Đã xóa bản đồ.")
 
-    # --- HÀM NAVIGATE_TO_TARGET ĐƯỢC THÊM VÀO LỚP ---
+    def move(self, distance_m):
+        """
+        Di chuyển với giá trị lệnh gửi cho ESP nhận theo đơn vị mét.
+        Tuy nhiên, pose được cập nhật theo mm, nên khi so sánh convert về mét.
+        """
+        initial_x, initial_y = self.pose_x, self.pose_y
+        # Gửi lệnh với đơn vị là mét (giá trị distance_m)
+        cmd = f"MOVE {distance_m}"
+        self.send_command(cmd)
+
+        tolerance = 0.02  # Sai số cho phép: 2 cm
+        start_time = time.time()
+        timeout = 10  # timeout là 10 giây
+
+        while True:
+            # pose_x, pose_y tính theo mm → chuyển về mét để so sánh
+            current_distance_m = sqrt((self.pose_x - initial_x) ** 2 + (self.pose_y - initial_y) ** 2) / 1000.0
+            if current_distance_m >= distance_m - tolerance:
+                break
+            if time.time() - start_time > timeout:
+                print("Timeout khi di chuyển!")
+                break
+            time.sleep(0.1)
+
+    def rotate(self, angle_rad):
+        """
+        Quay theo góc angle_rad (đơn vị radian) và gửi lệnh trực tiếp.
+        """
+        target_theta = self.pose_theta + angle_rad
+        target_theta = atan2(sin(target_theta), cos(target_theta))
+        tolerance = 0.1  # sai số cho phép: 0.1 rad
+        cmd = f"ROTATE {angle_rad}"
+        self.send_command(cmd)
+
+        start_time = time.time()
+        timeout = 10
+
+        while True:
+            error = abs(atan2(sin(self.pose_theta - target_theta), cos(self.pose_theta - target_theta)))
+            if error < tolerance:
+                break
+            if time.time() - start_time > timeout:
+                print("Timeout khi quay!")
+                break
+            time.sleep(0.1)
+
     def navigate_to_target(self, target_x, target_y):
-        # Tính tọa độ đích trên lưới (grid)
+        """
+        Tính toán đường đi từ vị trí hiện tại đến tọa độ target (mm) trên bản đồ.
+        Sau đó di chuyển qua từng waypoint bằng cách quay và di chuyển.
+        Lưu ý: Hàm này chứa vòng lặp chờ cho move/rotate nên cần được gọi trong thread riêng.
+        """
         grid_target = (int((target_x + self.map_size_mm / 2) / self.GRID_SIZE),
                        int((target_y + self.map_size_mm / 2) / self.GRID_SIZE))
         grid_start = (int((self.pose_x + self.map_size_mm / 2) / self.GRID_SIZE),
@@ -587,29 +598,28 @@ class LidarData:
             return
 
         smooth_waypoints = smooth_path(path, self.global_map)
-        # Chuyển đổi tọa độ grid về tọa độ thực (mm)
+        # Chuyển đổi tọa độ grid sang tọa độ thực (mm)
         waypoints_x = [cell[0] * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2 for cell in
                        smooth_waypoints]
         waypoints_y = [cell[1] * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2 for cell in
                        smooth_waypoints]
-
-        # Vẽ các waypoint lên bản đồ để theo dõi
+        # Vẽ các waypoint lên bản đồ
         self.ax.plot(waypoints_x, waypoints_y, 'bo-', markersize=5, label='Smoothed Waypoints')
         self.ax.legend()
         self.fig.canvas.draw()
 
-        # Di chuyển qua từng waypoint
         for wx, wy in zip(waypoints_x, waypoints_y):
             desired_angle = atan2(wy - self.pose_y, wx - self.pose_x)
             angle_diff = desired_angle - self.pose_theta
             angle_diff = atan2(sin(angle_diff), cos(angle_diff))
             print(f"Di chuyển đến waypoint tại ({wx:.1f}, {wy:.1f}); cần xoay {angle_diff:.3f} rad")
             self.rotate(angle_diff)
-            # Tính khoảng cách cần di chuyển (đã ở mm)
             distance = sqrt((wx - self.pose_x) ** 2 + (wy - self.pose_y) ** 2)
-            # Chuyển khoảng cách từ mm sang mét trước khi gọi move
-            self.move(distance / 1000)
+            # Vì pose tính theo mm nên chuyển về mét cho lệnh move
+            self.move(distance / 1000.0)
         print("Đã hoàn thành di chuyển đến vị trí đích")
+
+
 # ------------------------------
 # Chương trình chính
 # ------------------------------

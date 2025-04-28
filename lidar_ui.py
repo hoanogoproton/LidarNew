@@ -48,29 +48,6 @@ class LidarWindow(QMainWindow):
         offset_layout.addWidget(self.offset_value_label)
         vbox.addLayout(offset_layout)
 
-        # Layout cho chỉnh hướng ban đầu
-        heading_layout = QHBoxLayout()
-        self.heading_input = QLineEdit()
-        self.heading_input.setPlaceholderText("Θ (deg)")
-        self.set_heading_btn = QPushButton("Set Heading")
-        self.set_heading_btn.clicked.connect(self.on_set_heading)
-        heading_layout.addWidget(QLabel("Adjust Heading:"))
-        heading_layout.addWidget(self.heading_input)
-        heading_layout.addWidget(self.set_heading_btn)
-        vbox.addLayout(heading_layout)
-
-        # Layout cho thanh trượt điều khiển tốc độ
-        speed_layout = QHBoxLayout()
-        self.speed_label = QLabel("Speed:")
-        self.speed_slider = QSlider(Qt.Horizontal)
-        self.speed_slider.setRange(0, 255)
-        self.speed_slider.setValue(128)
-        self.speed_value_label = QLabel("128")
-        self.speed_slider.valueChanged.connect(self.change_speed)
-        speed_layout.addWidget(self.speed_label)
-        speed_layout.addWidget(self.speed_slider)
-        speed_layout.addWidget(self.speed_value_label)
-        vbox.addLayout(speed_layout)
 
         # Layout chứa các nút điều khiển di chuyển và nhãn trạng thái
         btn_layout = QHBoxLayout()
@@ -151,11 +128,6 @@ class LidarWindow(QMainWindow):
         nav_thread.start()
         self.status_label.setText(f"Navigating to: ({target_x:.2f}, {target_y:.2f}) mm")
 
-    def change_speed(self, value):
-        self.speed_value_label.setText(str(value))
-        command = f"set_speed {value}"
-        self.lidar.send_command(command)
-
     def reconnect_device(self):
         new_ip = self.ip_input.text().strip()
         if new_ip:
@@ -224,19 +196,6 @@ class LidarWindow(QMainWindow):
         self.lidar.cleanup()
         event.accept()
 
-    def on_set_heading(self):
-        try:
-            theta_deg = float(self.heading_input.text())
-        except ValueError:
-            QMessageBox.warning(self, "Invalid Input", "Θ phải là số (độ) hợp lệ!")
-            return
-        theta = theta_deg * pi / 180
-        try:
-            self.lidar.set_heading(theta)
-        except Exception as e:
-            QMessageBox.critical(self, "Error Setting Heading", f"Không thể điều chỉnh hướng:\n{e}")
-            return
-        self.status_label.setText(f"Hướng đã chỉnh: θ={theta_deg:.1f}°")
 
     def change_offset(self, value):
         self.offset_value_label.setText(str(value))

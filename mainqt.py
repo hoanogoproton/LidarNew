@@ -180,7 +180,7 @@ class LidarData:
     MAX_DATA_SIZE = 180  # Tích lũy nhiều điểm trước khi vẽ
     NEIGHBOR_RADIUS = 48
     MIN_NEIGHBORS = 4
-    GRID_SIZE = 30      # mm
+    GRID_SIZE = 50      # mm
 
     def __init__(self, host='192.168.100.148', port=80, neighbor_radius=48, min_neighbors=4):
         self.host = host
@@ -224,11 +224,11 @@ class LidarData:
 
         self.last_encoder_left = None
         self.last_encoder_right = None
-        self.wheel_base = 138  # mm
+        self.wheel_base = 130  # mm
 
         # Khởi tạo figure cho matplotlib
         self.fig, self.ax = plt.subplots()
-        self.ax.set_title("Global Map with Robot Position")
+        self.ax.set_title("Global Map")
         self.ax.grid(True)
 
         # Khởi tạo global map (occupancy grid)
@@ -399,6 +399,10 @@ class LidarData:
 
     def update_data(self):
         buffer = ""
+        # Biến đếm vòng quét để khởi động ICP sau khoảng thời gian ổn định
+        if not hasattr(self, 'scan_count'):
+            self.scan_count = 0
+
         while self.running:
             if self.sock is None:
                 time.sleep(0.1)
@@ -437,6 +441,8 @@ class LidarData:
                 except ValueError as e:
                     logging.error("Error parsing sensor data %s: %s", sensor_data, e)
                     continue
+
+                # Xử lý odometry như cũ...
                 if self.last_encoder_left is None:
                     self.last_encoder_left = encoder_count
                     self.last_encoder_right = encoder_count2
@@ -454,28 +460,37 @@ class LidarData:
                     delta_s = (delta_left + delta_right) / 2.0
                     delta_theta_enc = (delta_right - delta_left) / self.wheel_base
                     delta_theta_gyro = gyro_z * delta_t
+                    logging.info(
+                        "Odometry: delta_left=%.2f mm, delta_right=%.2f mm, delta_theta_enc=%.4f rad, delta_theta_gyro=%.4f rad",
+                        delta_left, delta_right, delta_theta_enc, delta_theta_gyro)
+                    # Giả sử dùng trọng số hiện tại
                     delta_theta = 1 * delta_theta_gyro + 0 * delta_theta_enc
-                    logging.debug("Encoder: left=%d, right=%d, delta_left=%.2f mm, delta_right=%.2f mm",
-                                  encoder_count, encoder_count2, delta_left, delta_right)
-                    logging.debug("Odometry: delta_s=%.2f mm, delta_theta_enc=%.4f rad, delta_theta_gyro=%.4f rad",
-                                  delta_s, delta_theta_enc, delta_theta_gyro)
                     if not hasattr(self, 'ekf_slam'):
                         self.ekf_slam = EKFSLAM([self.pose_x, self.pose_y, self.pose_theta])
-                    motion_cov = np.diag([1e-1, 1e-1, 1e-2])
+                    motion_cov = np.diag([1e-3, 1e-3, 1e-1])
                     self.ekf_slam.predict(delta_s, delta_theta, motion_cov)
                     self.pose_x, self.pose_y, self.pose_theta = self.ekf_slam.state
                     logging.info("Pose updated (EKF): x=%.2f mm, y=%.2f mm, theta=%.4f rad",
                                  self.pose_x, self.pose_y, self.pose_theta)
                     self.last_encoder_left = encoder_count
                     self.last_encoder_right = encoder_count2
+
                 self.robot_distance = (((encoder_count - self.initial_encoder_left) +
                                         (encoder_count2 - self.initial_encoder_right)) / 2
                                        * self.wheel_circumference / self.ppr)
                 logging.info("Total distance traveled: %.2f mm", self.robot_distance)
-                angles = (np.arange(4) + base_angle) * (pi / 180)
+
+                # --- Xử lý dữ liệu LiDAR (Motion Distortion Correction) ---
+                n_points = 4
+                SCAN_DURATION = 0.05
+                dt = SCAN_DURATION / n_points
+                raw_angles = (np.arange(n_points) + base_angle) * (pi / 180)
+                corrected_angles = raw_angles - gyro_z * dt * np.arange(n_points)
                 valid_mask = (distances >= self.MIN_DISTANCE) & (distances <= self.MAX_DISTANCE)
-                valid_angles = angles[valid_mask]
+                valid_angles = corrected_angles[valid_mask]
                 valid_distances = distances[valid_mask]
+                # --- KẾT THÚC xử lý LiDAR ---
+
                 if valid_angles.size > 0:
                     for i in range(len(valid_angles)):
                         meas_range = valid_distances[i]
@@ -484,7 +499,7 @@ class LidarData:
                         lx = self.ekf_slam.state[0] + meas_range * cos(self.ekf_slam.state[2] + meas_bearing)
                         ly = self.ekf_slam.state[1] + meas_range * sin(self.ekf_slam.state[2] + meas_bearing)
                         landmark_pos = np.array([lx, ly])
-                        measurement_cov = np.diag([1e-3, 1e-4])
+                        measurement_cov = np.diag([1e-3, 1e-1])
                         self.ekf_slam.update(z, landmark_pos, measurement_cov)
                 with self.data_lock:
                     self.data['angles'].extend(valid_angles.tolist())
@@ -498,6 +513,32 @@ class LidarData:
                         self.data['angles'] = [self.data['angles'][i] for i in indices]
                         self.data['distances'] = [self.data['distances'][i] for i in indices]
                         self.data['speed'] = [self.data['speed'][i] for i in indices]
+
+                # --- Xử lý Scan Matching ---
+                global_x, global_y = self._to_global_coordinates(valid_angles.tolist(), valid_distances.tolist())
+                current_scan_points = np.array(list(zip(global_x, global_y)))
+
+                # Tăng biến đếm vòng quét
+                self.scan_count += 1
+
+                # Chỉ thực hiện ICP sau một số vòng quét đầu tiên (ví dụ sau 5 quét) và với số điểm hiện có
+                if self.scan_count > 5 and current_scan_points.shape[0] > 0:
+                    if hasattr(self, 'prev_scan_points') and self.prev_scan_points is not None and \
+                            self.prev_scan_points.shape[0] > 0:
+                        R_icp, t_icp = self.icp(self.prev_scan_points, current_scan_points)
+                        dTheta_icp = atan2(R_icp[1, 0], R_icp[0, 0])
+                        # Nếu kết quả ICP hợp lý (vd: dịch chuyển không vượt quá ngưỡng)
+                        if abs(t_icp[0, 0]) < 100 and abs(t_icp[1, 0]) < 100 and abs(dTheta_icp) < 0.5:
+                            # Cập nhật pose theo một hệ số nhẹ để làm mịn hiệu chỉnh
+                            alpha = 0.2
+                            self.pose_x = (1 - alpha) * self.pose_x + alpha * (self.pose_x + t_icp[0, 0])
+                            self.pose_y = (1 - alpha) * self.pose_y + alpha * (self.pose_y + t_icp[1, 0])
+                            self.pose_theta += alpha * dTheta_icp
+                            self.pose_theta = atan2(sin(self.pose_theta), cos(self.pose_theta))
+                            logging.info("Scan Matching Update: dx=%.2f mm, dy=%.2f mm, dtheta=%.4f rad",
+                                         t_icp[0, 0], t_icp[1, 0], dTheta_icp)
+                    # Cập nhật quét tham chiếu
+                    self.prev_scan_points = current_scan_points.copy()
 
     def send_command(self, command):
         self.command_queue.put(command)
@@ -584,47 +625,134 @@ class LidarData:
 
     def navigate_to_target(self, target_x, target_y):
         """
-        Tính toán đường đi từ vị trí hiện tại đến tọa độ target (mm) trên bản đồ.
-        Sau đó di chuyển qua từng waypoint bằng cách quay và di chuyển.
-        Lưu ý: Hàm này chứa vòng lặp chờ cho move/rotate nên cần được gọi trong thread riêng.
+        Định hướng robot từ vị trí hiện tại đến tọa độ target (mm) trên bản đồ.
+        Tái lập kế hoạch định kỳ để phản ứng kịp thời với môi trường thay đổi dựa trên bản đồ được cập nhật.
         """
-        grid_target = (int((target_x + self.map_size_mm / 2) / self.GRID_SIZE),
-                       int((target_y + self.map_size_mm / 2) / self.GRID_SIZE))
-        grid_start = (int((self.pose_x + self.map_size_mm / 2) / self.GRID_SIZE),
-                      int((self.pose_y + self.map_size_mm / 2) / self.GRID_SIZE))
-        path = a_star_search(self.global_map, grid_start, grid_target)
-        if not path:
-            print("Không tìm được đường đi đến đích!")
-            return
+        # Sử dụng tolerance là bán kính tối thiểu xác định đã đến gần đích
+        tolerance = self.GRID_SIZE / 2  # ví dụ: nửa ô của grid (15 mm khi GRID_SIZE=30)
 
-        smooth_waypoints = smooth_path(path, self.global_map)
-        # Chuyển đổi tọa độ grid sang tọa độ thực (mm)
-        waypoints_x = [cell[0] * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2 for cell in
-                       smooth_waypoints]
-        waypoints_y = [cell[1] * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2 for cell in
-                       smooth_waypoints]
-        # Vẽ các waypoint lên bản đồ
-        self.ax.plot(waypoints_x, waypoints_y, 'bo-', markersize=5, label='Smoothed Waypoints')
-        self.ax.legend()
-        self.fig.canvas.draw()
+        while True:
+            # Tính vị trí hiện tại trên grid và đích theo đơn vị grid
+            grid_start = (
+                int((self.pose_x + self.map_size_mm / 2) / self.GRID_SIZE),
+                int((self.pose_y + self.map_size_mm / 2) / self.GRID_SIZE)
+            )
+            grid_target = (
+                int((target_x + self.map_size_mm / 2) / self.GRID_SIZE),
+                int((target_y + self.map_size_mm / 2) / self.GRID_SIZE)
+            )
 
-        for wx, wy in zip(waypoints_x, waypoints_y):
+            # Tìm đường đi bằng A*
+            path = a_star_search(self.global_map, grid_start, grid_target)
+            if not path:
+                print("Không tìm được đường đi đến đích!")
+                return
+
+            # Làm mượt đường đi
+            smooth_waypoints = smooth_path(path, self.global_map)
+            # Chuyển đổi tọa độ grid sang tọa độ thực (mm)
+            waypoints_x = [
+                cell[0] * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2
+                for cell in smooth_waypoints
+            ]
+            waypoints_y = [
+                cell[1] * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2
+                for cell in smooth_waypoints
+            ]
+
+            # Vẽ đường đi lên bản đồ (nếu muốn hiển thị)
+            self.ax.plot(waypoints_x, waypoints_y, 'bo-', markersize=5, label='Smoothed Waypoints')
+            self.ax.legend()
+            self.fig.canvas.draw()
+
+            # Chọn waypoint đầu tiên nằm xa vị trí hiện tại một cách đáng kể (để tránh lặp lại quá nhỏ)
+            next_waypoint = None
+            for wx, wy in zip(waypoints_x, waypoints_y):
+                distance = sqrt((wx - self.pose_x) ** 2 + (wy - self.pose_y) ** 2)
+                if distance > tolerance:
+                    next_waypoint = (wx, wy)
+                    break
+            # Nếu không tìm thấy waypoint nào thỏa, coi như đã đến đích
+            if next_waypoint is None:
+                print("Đã đến gần đích")
+                return
+
+            wx, wy = next_waypoint
+            # Tính góc cần quay
             desired_angle = atan2(wy - self.pose_y, wx - self.pose_x)
             angle_diff = desired_angle - self.pose_theta
             angle_diff = atan2(sin(angle_diff), cos(angle_diff))
             print(f"Di chuyển đến waypoint tại ({wx:.1f}, {wy:.1f}); cần xoay {angle_diff:.3f} rad")
+
+            # Thực hiện quay và di chuyển
             self.rotate(angle_diff)
-            distance = sqrt((wx - self.pose_x) ** 2 + (wy - self.pose_y) ** 2)
-            # Vì pose tính theo mm nên chuyển về mét cho lệnh move
-            self.move(distance / 1000.0)
-        print("Đã hoàn thành di chuyển đến vị trí đích")
+            # Chuyển khoảng cách từ mm sang mét (do hàm move gửi lệnh với đơn vị mét)
+            distance_m = sqrt((wx - self.pose_x) ** 2 + (wy - self.pose_y) ** 2) / 1000.0
+            self.move(distance_m)
+
+            # Sau mỗi bước di chuyển, kiểm tra khoảng cách còn lại đến đích
+            overall_distance = sqrt((target_x - self.pose_x) ** 2 + (target_y - self.pose_y) ** 2)
+            print(f"Khoảng cách còn lại đến đích: {overall_distance:.1f} mm")
+            if overall_distance < tolerance:
+                print("Đã hoàn thành di chuyển đến vị trí đích")
+                return
+
+    def icp(self, A, B, max_iterations=30, tolerance=1e-4):
+        """
+        Thực hiện ICP giữa hai tập điểm A và B.
+        A, B: numpy arrays kích thước (N,2)
+        Trả về (R, t): ma trận quay (2x2) và vector dịch chuyển (2x1),
+            đại diện cho phép biến đổi từ B sang A.
+        """
+        if A.shape[0] == 0 or B.shape[0] == 0:
+            # Nếu một trong hai tập rỗng, trả về không có thay đổi
+            return np.eye(2), np.zeros((2, 1))
+
+        prev_error = float('inf')
+        R = np.eye(2)
+        t = np.zeros((2, 1))
+        B_transformed = B.copy()
+
+        for i in range(max_iterations):
+            # Tính khoảng cách giữa mỗi điểm của A và tất cả các điểm của B_transformed
+            distances = np.linalg.norm(A[:, None] - B_transformed[None, :], axis=2)
+            # Nếu B_transformed không có điểm nào, trả về không thay đổi
+            if distances.size == 0:
+                return np.eye(2), np.zeros((2, 1))
+            indices = np.argmin(distances, axis=0)
+            closest_points = A[indices]
+
+            centroid_A = np.mean(closest_points, axis=0)
+            centroid_B = np.mean(B_transformed, axis=0)
+
+            AA = closest_points - centroid_A
+            BB = B_transformed - centroid_B
+
+            H = BB.T @ AA
+            U, S, Vt = np.linalg.svd(H)
+            R_iter = Vt.T @ U.T
+            if np.linalg.det(R_iter) < 0:
+                Vt[1, :] *= -1
+                R_iter = Vt.T @ U.T
+            t_iter = centroid_A.reshape(2, 1) - R_iter @ centroid_B.reshape(2, 1)
+
+            B_transformed = (R_iter @ B_transformed.T).T + t_iter.T
+
+            mean_error = np.mean(np.linalg.norm(closest_points - B_transformed, axis=1))
+            if abs(prev_error - mean_error) < tolerance:
+                break
+            prev_error = mean_error
+            R = R_iter @ R
+            t = R_iter @ t + t_iter
+
+        return R, t
 
 
 # ------------------------------
 # Chương trình chính
 # ------------------------------
 if __name__ == "__main__":
-    lidar = LidarData(host='192.168.0.112', port=80, neighbor_radius=30, min_neighbors=7)
+    lidar = LidarData(host='192.168.0.114', port=80, neighbor_radius=30, min_neighbors=7)
     data_thread = threading.Thread(target=lidar.update_data, daemon=True)
     data_thread.start()
     app = QApplication(sys.argv)

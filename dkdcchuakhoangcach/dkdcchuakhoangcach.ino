@@ -19,7 +19,7 @@ unsigned long lastYawTime = 0;
 
 // Robot parameters (tùy chỉnh theo robot của bạn)
 const float WHEEL_RADIUS = 0.035;       // m
-const float WHEEL_BASE   = 0.175;       // m (khoảng cách tâm hai bánh)
+const float WHEEL_BASE   = 0.13;       // m (khoảng cách tâm hai bánh)
 const int   ENCODER_PPR  = 500;        // xung/rev
 const float WHEEL_CIRCUMFERENCE = 2 * PI * WHEEL_RADIUS;
 

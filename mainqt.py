@@ -10,6 +10,7 @@ from math import pi, cos, sin, atan2, sqrt
 from PyQt5.QtWidgets import QApplication
 import logging
 import heapq
+import scipy.optimize as opt  # Dùng SciPy cho pose-graph optimization
 
 from lidar_ui import LidarWindow  # Nhập giao diện từ file lidar_ui.py
 
@@ -203,6 +204,7 @@ class LidarData:
         self.data_event = threading.Event()
         self.running = True
 
+        self.mapping_enabled = True
         # Các thuộc tính khác
         self.pose_x = 0.0
         self.pose_y = 0.0
@@ -214,7 +216,7 @@ class LidarData:
         # Ngưỡng dịch chuyển (mm) để cập nhật keyframe
         self.keyframe_trans_thresh = 500.0    # ví dụ: 0.5 m
         # Ngưỡng xoay (rad) để cập nhật keyframe
-        self.keyframe_rot_thresh   = 0.52  # ~10°
+        self.keyframe_rot_thresh   = 0.8  # ~10°
         # Lưu pose (x, y, theta) của keyframe gần nhất
         self.last_keyframe_pose = np.array([self.pose_x, self.pose_y, self.pose_theta])
 
@@ -233,7 +235,7 @@ class LidarData:
 
         self.last_encoder_left = None
         self.last_encoder_right = None
-        self.wheel_base = 130  # mm
+        self.wheel_base = 105  # mm
 
         # Khởi tạo figure cho matplotlib
         self.fig, self.ax = plt.subplots()
@@ -246,6 +248,14 @@ class LidarData:
         self.global_map = np.full((self.global_map_dim, self.global_map_dim), 127, dtype=np.uint8)
 
         self.pose_lock = threading.Lock()
+
+        # --- Pose-graph SLAM tự triển khai ---
+        # Danh sách keyframe pose (x [m], y [m], theta [rad])
+        self.keyframes = []
+        # Danh sách constraint: (i, j, measurement [dx, dy, dtheta], information_matrix 3x3)
+        self.edges = []
+        # Thêm keyframe đầu tiên
+        self._add_keyframe(self.pose_x, self.pose_y, self.pose_theta)
 
         # Queue dành cho IPC thread
         self.icp_queue = queue.Queue()
@@ -264,6 +274,54 @@ class LidarData:
         self.process_thread = threading.Thread(target=self.process_data, daemon=True)
         self.process_thread.start()
 
+    def _add_keyframe(self, x_mm, y_mm, theta):
+        x = x_mm / 1000.0
+        y = y_mm / 1000.0
+        # Chỉ thêm edge nếu đã có keyframe trước
+        if self.keyframes:
+            idx_prev = len(self.keyframes) - 1
+            x0, y0, t0 = self.keyframes[idx_prev]
+            dx = x - x0
+            dy = y - y0
+            dtheta = atan2(sin(theta - t0), cos(theta - t0))
+            info = np.eye(3) * 100  # thông tin (có thể tinh chỉnh)
+            self.edges.append((idx_prev, idx_prev + 1, np.array([dx, dy, dtheta]), info))
+        # Thêm new keyframe
+        self.keyframes.append(np.array([x, y, theta]))
+
+    def _optimize_pose_graph(self):
+        def residuals(vars):
+            res = []
+            for i, j, meas, info in self.edges:
+                xi = vars[3 * i:3 * i + 3]
+                xj = vars[3 * j:3 * j + 3]
+                # relative pose from i to j
+                dx_ij = xj - xi
+                dx_ij[2] = atan2(sin(dx_ij[2]), cos(dx_ij[2]))
+                err = dx_ij - meas
+                # weight by sqrt of information
+                W = np.linalg.cholesky(info)
+                res.extend((W @ err).tolist())
+            return np.array(res)
+
+        # Thêm prior để cố định node 0
+        def full_res(vars):
+            r = residuals(vars)
+            prior = vars[0:3] - self.keyframes[0]
+            W0 = np.eye(3) * 1000
+            pr = (W0 @ prior).tolist()
+            return np.hstack([r, pr])
+
+        # Biến ban đầu
+        vars0 = np.hstack(self.keyframes)
+        sol = opt.least_squares(full_res, vars0, verbose=0)
+        vars_opt = sol.x
+        # Cập nhật keyframes và state
+        N = len(self.keyframes)
+        for k in range(N):
+            self.keyframes[k] = vars_opt[3 * k:3 * k + 3]
+        x, y, th = self.keyframes[-1]
+        self.pose_x, self.pose_y, self.pose_theta = x * 1000, y * 1000, th
     def set_heading(self, theta):
         with self.pose_lock:
             self.pose_theta = theta
@@ -480,10 +538,10 @@ class LidarData:
                         "Odometry: delta_left=%.2f mm, delta_right=%.2f mm, delta_theta_enc=%.4f rad, delta_theta_gyro=%.4f rad",
                         delta_left, delta_right, delta_theta_enc, delta_theta_gyro)
                     # Giả sử dùng trọng số hiện tại
-                    delta_theta = 1 * delta_theta_gyro + 0 * delta_theta_enc
+                    delta_theta = 0.7 * delta_theta_gyro + 0.3 * delta_theta_enc
                     if not hasattr(self, 'ekf_slam'):
                         self.ekf_slam = EKFSLAM([self.pose_x, self.pose_y, self.pose_theta])
-                    motion_cov = np.diag([1e-3, 1e-3, 2e-2])
+                    motion_cov = np.diag([1e-3, 1e-3, 3e-2])
                     self.ekf_slam.predict(delta_s, delta_theta, motion_cov)
                     self.pose_x, self.pose_y, self.pose_theta = self.ekf_slam.state
                     logging.info("Pose updated (EKF): x=%.2f mm, y=%.2f mm, theta=%.4f rad",
@@ -559,8 +617,11 @@ class LidarData:
 
     def _icp_worker(self):
         """
-        Thread chạy ICP độc lập, nhận dữ liệu từ queue,
-        match scan với keyframe thông minh, sau đó cập nhật pose.
+        Nhận (state, scan_points) từ queue:
+          1) Thêm constraint odometry giữa keyframe trước và hiện tại
+          2) Thêm loop-closure nếu phát hiện scan hiện tại gần một keyframe cũ
+          3) Tối ưu toàn cục pose-graph bằng least-squares
+          4) Cập nhật lại pose_x, pose_y, pose_theta
         """
         while self.running:
             try:
@@ -570,42 +631,55 @@ class LidarData:
 
             init_x, init_y, init_theta = state
 
-            # Khởi tạo keyframe lần đầu
-            if self.keyframe_points is None:
-                self.keyframe_points = scan_points.copy()
-                self.last_keyframe_pose = np.array([init_x, init_y, init_theta])
+            # --- Keyframe đầu tiên ---
+            if len(self.keyframes) == 1:
+                # Thêm node 1 (keyframe thứ hai)
+                self._add_keyframe(init_x, init_y, init_theta)
+                self._keyframe_scans.append(scan_points.copy())
+                self.last_kf_x, self.last_kf_y, self.last_kf_th = init_x, init_y, init_theta
                 self.icp_queue.task_done()
                 continue
 
-            # Tính Δ-pose so với keyframe trước
-            dx = init_x - self.last_keyframe_pose[0]
-            dy = init_y - self.last_keyframe_pose[1]
-            dtrans = sqrt(dx * dx + dy * dy)
-            drot = abs(atan2(sin(init_theta - self.last_keyframe_pose[2]),
-                             cos(init_theta - self.last_keyframe_pose[2])))
+            # --- 1) Odometry constraint ---
+            # Tính relative pose từ keyframe trước đến hiện tại (đơn vị mét/radian)
+            dx = (init_x - self.last_kf_x) / 1000.0
+            dy = (init_y - self.last_kf_y) / 1000.0
+            dtheta = atan2(sin(init_theta - self.last_kf_th),
+                           cos(init_theta - self.last_kf_th))
 
-            # Đánh dấu có cần cập nhật keyframe mới không
-            need_new_keyframe = (dtrans > self.keyframe_trans_thresh
-                                 or drot > self.keyframe_rot_thresh)
+            idx_prev = len(self.keyframes) - 1
+            idx_new = idx_prev + 1
+            info_odom = np.eye(3) * 50  # ma trận information (cân nhắc tinh chỉnh)
+            # Thêm edge between(prev, new)
+            self.edges.append((idx_prev, idx_new,
+                               np.array([dx, dy, dtheta]),
+                               info_odom))
 
-            # Thực hiện ICP giữa keyframe và scan mới
-            R_icp, t_icp = self.icp(self.keyframe_points, scan_points)
-            dtheta_icp = atan2(R_icp[1, 0], R_icp[0, 0])
+            # Thêm keyframe mới và lưu scan tương ứng
+            self.keyframes.append(np.array([init_x / 1000.0, init_y / 1000.0, init_theta]))
+            self._keyframe_scans.append(scan_points.copy())
 
-            # Nếu ICP hợp lý thì update pose mềm mại
-            if abs(t_icp[0, 0]) < 100 and abs(t_icp[1, 0]) < 100 and abs(dtheta_icp) < 0.5:
-                alpha = 0.2
-                with self.pose_lock:
-                    self.pose_x += alpha * t_icp[0, 0]
-                    self.pose_y += alpha * t_icp[1, 0]
-                    self.pose_theta += alpha * dtheta_icp
-                    self.pose_theta = atan2(sin(self.pose_theta), cos(self.pose_theta))
+            # --- 2) Loop-closure ---
+            # Với mỗi keyframe cũ, nếu khoảng cách trong bán kính, thêm constraint
+            for k, (xk, yk, thk) in enumerate(self.keyframes[:-1]):
+                dist = sqrt((init_x / 1000.0 - xk) ** 2 + (init_y / 1000.0 - yk) ** 2)
+                if dist < self.loop_closure_radius:
+                    # Dùng ICP để ước lượng transform từ scan cũ sang scan hiện tại
+                    R_clos, t_clos = self.icp(self._keyframe_scans[k], scan_points)
+                    dtheta_c = atan2(R_clos[1, 0], R_clos[0, 0])
+                    meas = np.array([t_clos[0, 0] / 1000.0,
+                                     t_clos[1, 0] / 1000.0,
+                                     dtheta_c])
+                    info_clos = np.eye(3) * 10
+                    self.edges.append((k, idx_new, meas, info_clos))
 
-            # Nếu đã vượt ngưỡng, cập nhật scan làm keyframe mới
-            if need_new_keyframe:
-                self.keyframe_points = scan_points.copy()
-                self.last_keyframe_pose = np.array([init_x, init_y, init_theta])
+            # Cập nhật last keyframe để lần sau đo odometry
+            self.last_kf_x, self.last_kf_y, self.last_kf_th = init_x, init_y, init_theta
 
+            # --- 3) Tối ưu toàn cục ---
+            self._optimize_pose_graph()
+
+            # Đánh dấu xử lý xong
             self.icp_queue.task_done()
 
     def send_command(self, command):
@@ -644,6 +718,31 @@ class LidarData:
             self.data['x_coords'].clear()
             self.data['y_coords'].clear()
         print("Đã xóa bản đồ.")
+
+    def save_map(self, filename_npz):
+        """
+        Lưu occupancy grid và metadata (grid size, origin) vào file .npz
+        """
+        import numpy as _np
+        _np.savez_compressed(filename_npz,
+                             global_map=self.global_map,
+                             grid_size=self.GRID_SIZE,
+                             map_size_mm=self.map_size_mm)
+        print(f"[LidarData] Saved map to {filename_npz}")
+
+    def load_map(self, filename_npz):
+        """
+        Nạp bản đồ đã lưu, tắt luôn cơ chế mapping
+        """
+        import numpy as _np
+        data = _np.load(filename_npz)
+        self.global_map = data["global_map"]
+        self.GRID_SIZE  = int(data["grid_size"])
+        self.map_size_mm = float(data["map_size_mm"])
+        self.global_map_dim = self.global_map.shape[0]
+        self.mapping_enabled = False
+        print(f"[LidarData] Loaded map from {filename_npz}")
+
 
     def move(self, distance_m):
         """

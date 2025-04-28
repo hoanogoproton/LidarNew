@@ -1,4 +1,4 @@
-from PyQt5.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit, QSlider, QMessageBox
+from PyQt5.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QFileDialog, QHBoxLayout, QPushButton, QLabel, QLineEdit, QSlider, QMessageBox
 from PyQt5.QtCore import QTimer, Qt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from math import pi
@@ -48,6 +48,15 @@ class LidarWindow(QMainWindow):
         offset_layout.addWidget(self.offset_value_label)
         vbox.addLayout(offset_layout)
 
+        # --- Save / Load map buttons ---
+        io_layout = QHBoxLayout()
+        self.save_map_btn = QPushButton("Save Map…")
+        self.save_map_btn.clicked.connect(self.on_save_map)
+        self.load_map_btn = QPushButton("Load Map…")
+        self.load_map_btn.clicked.connect(self.on_load_map)
+        io_layout.addWidget(self.save_map_btn)
+        io_layout.addWidget(self.load_map_btn)
+        vbox.addLayout(io_layout)
 
         # Layout chứa các nút điều khiển di chuyển và nhãn trạng thái
         btn_layout = QHBoxLayout()
@@ -204,3 +213,30 @@ class LidarWindow(QMainWindow):
         self.lidar.reset_map()
         self.lidar._plot_map()
         self.canvas.draw()
+
+    def on_save_map(self):
+        # Mở file dialog để chọn nơi lưu
+        fname, _ = QFileDialog.getSaveFileName(self, "Save map as…", "", "NumPy compressed (*.npz)")
+        if not fname:
+            return
+        if not fname.lower().endswith(".npz"):
+            fname += ".npz"
+        try:
+            self.lidar.save_map(fname)
+            QMessageBox.information(self, "Saved", f"Map saved to:\n{fname}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Không thể lưu map:\n{e}")
+
+    def on_load_map(self):
+        # Mở file dialog để chọn file map
+        fname, _ = QFileDialog.getOpenFileName(self, "Load map from…", "", "NumPy compressed (*.npz)")
+        if not fname:
+            return
+        try:
+            self.lidar.load_map(fname)
+            # Khi load xong, vẽ lại và cập nhật canvas
+            self.lidar._plot_map()
+            self.canvas.draw()
+            QMessageBox.information(self, "Loaded", f"Map loaded from:\n{fname}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Không thể load map:\n{e}")

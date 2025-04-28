@@ -210,6 +210,15 @@ class LidarData:
         # Khởi tạo ekf_slam ngay từ đầu
         self.ekf_slam = EKFSLAM([self.pose_x, self.pose_y, self.pose_theta])
 
+        # ---- Smart keyframe parameters ----
+        # Ngưỡng dịch chuyển (mm) để cập nhật keyframe
+        self.keyframe_trans_thresh = 500.0    # ví dụ: 0.5 m
+        # Ngưỡng xoay (rad) để cập nhật keyframe
+        self.keyframe_rot_thresh   = 0.52  # ~10°
+        # Lưu pose (x, y, theta) của keyframe gần nhất
+        self.last_keyframe_pose = np.array([self.pose_x, self.pose_y, self.pose_theta])
+
+
         # Thông số encoder
         self.wheel_diameter = 70  # mm
         self.ppr = 500            # pulses per revolution
@@ -237,6 +246,13 @@ class LidarData:
         self.global_map = np.full((self.global_map_dim, self.global_map_dim), 127, dtype=np.uint8)
 
         self.pose_lock = threading.Lock()
+
+        # Queue dành cho IPC thread
+        self.icp_queue = queue.Queue()
+        self.keyframe_points = None
+        # Thread riêng để chạy ICP
+        self.icp_thread = threading.Thread(target=self._icp_worker, daemon=True)
+        self.icp_thread.start()
         if not self._connect_wifi():
             logging.error("Kết nối ban đầu không thành công. Vui lòng nhập IP ESP32 thủ công qua giao diện.")
         else:
@@ -467,7 +483,7 @@ class LidarData:
                     delta_theta = 1 * delta_theta_gyro + 0 * delta_theta_enc
                     if not hasattr(self, 'ekf_slam'):
                         self.ekf_slam = EKFSLAM([self.pose_x, self.pose_y, self.pose_theta])
-                    motion_cov = np.diag([1e-3, 1e-3, 1e-1])
+                    motion_cov = np.diag([1e-3, 1e-3, 2e-2])
                     self.ekf_slam.predict(delta_s, delta_theta, motion_cov)
                     self.pose_x, self.pose_y, self.pose_theta = self.ekf_slam.state
                     logging.info("Pose updated (EKF): x=%.2f mm, y=%.2f mm, theta=%.4f rad",
@@ -523,6 +539,7 @@ class LidarData:
 
                 # Chỉ thực hiện ICP sau một số vòng quét đầu tiên (ví dụ sau 5 quét) và với số điểm hiện có
                 if self.scan_count > 5 and current_scan_points.shape[0] > 0:
+                    self.icp_queue.put((self.ekf_slam.state.copy(), current_scan_points.copy()))
                     if hasattr(self, 'prev_scan_points') and self.prev_scan_points is not None and \
                             self.prev_scan_points.shape[0] > 0:
                         R_icp, t_icp = self.icp(self.prev_scan_points, current_scan_points)
@@ -539,6 +556,57 @@ class LidarData:
                                          t_icp[0, 0], t_icp[1, 0], dTheta_icp)
                     # Cập nhật quét tham chiếu
                     self.prev_scan_points = current_scan_points.copy()
+
+    def _icp_worker(self):
+        """
+        Thread chạy ICP độc lập, nhận dữ liệu từ queue,
+        match scan với keyframe thông minh, sau đó cập nhật pose.
+        """
+        while self.running:
+            try:
+                state, scan_points = self.icp_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            init_x, init_y, init_theta = state
+
+            # Khởi tạo keyframe lần đầu
+            if self.keyframe_points is None:
+                self.keyframe_points = scan_points.copy()
+                self.last_keyframe_pose = np.array([init_x, init_y, init_theta])
+                self.icp_queue.task_done()
+                continue
+
+            # Tính Δ-pose so với keyframe trước
+            dx = init_x - self.last_keyframe_pose[0]
+            dy = init_y - self.last_keyframe_pose[1]
+            dtrans = sqrt(dx * dx + dy * dy)
+            drot = abs(atan2(sin(init_theta - self.last_keyframe_pose[2]),
+                             cos(init_theta - self.last_keyframe_pose[2])))
+
+            # Đánh dấu có cần cập nhật keyframe mới không
+            need_new_keyframe = (dtrans > self.keyframe_trans_thresh
+                                 or drot > self.keyframe_rot_thresh)
+
+            # Thực hiện ICP giữa keyframe và scan mới
+            R_icp, t_icp = self.icp(self.keyframe_points, scan_points)
+            dtheta_icp = atan2(R_icp[1, 0], R_icp[0, 0])
+
+            # Nếu ICP hợp lý thì update pose mềm mại
+            if abs(t_icp[0, 0]) < 100 and abs(t_icp[1, 0]) < 100 and abs(dtheta_icp) < 0.5:
+                alpha = 0.2
+                with self.pose_lock:
+                    self.pose_x += alpha * t_icp[0, 0]
+                    self.pose_y += alpha * t_icp[1, 0]
+                    self.pose_theta += alpha * dtheta_icp
+                    self.pose_theta = atan2(sin(self.pose_theta), cos(self.pose_theta))
+
+            # Nếu đã vượt ngưỡng, cập nhật scan làm keyframe mới
+            if need_new_keyframe:
+                self.keyframe_points = scan_points.copy()
+                self.last_keyframe_pose = np.array([init_x, init_y, init_theta])
+
+            self.icp_queue.task_done()
 
     def send_command(self, command):
         self.command_queue.put(command)

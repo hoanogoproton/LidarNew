@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import QApplication
 import logging
 import heapq
 import scipy.optimize as opt  # Dùng SciPy cho pose-graph optimization
+from scipy.ndimage import distance_transform_edt
 
 from lidar_ui import LidarWindow  # Nhập giao diện từ file lidar_ui.py
 
@@ -436,34 +437,63 @@ class LidarData:
                 self.global_map[meas_grid_y, meas_grid_x] = 255
 
     def _plot_map(self):
-        angles, distances = self._filter_data(self.data['angles'], self.data['distances'])
-        if not angles:
-            return
-        global_x_coords, global_y_coords = self._to_global_coordinates(angles, distances)
-        filtered_x, filtered_y = self._remove_outliers(global_x_coords, global_y_coords)
-        downsampled_x, downsampled_y = self.voxel_downsample(filtered_x, filtered_y, voxel_size=self.GRID_SIZE)
-        with self.data_lock:
-            self.data['x_coords'].extend(downsampled_x)
-            self.data['y_coords'].extend(downsampled_y)
-            self.data['angles'].clear()
-            self.data['distances'].clear()
-        self.update_global_map(downsampled_x, downsampled_y)
+        """
+        Vẽ:
+         - always: bản đồ đã load (static map) & pose robot
+         - khi mapping_enabled=True: merge thêm scan mới vào map
+        """
+        # 1) Xóa axes cũ
         self.ax.clear()
-        extent = (-self.map_size_mm/2, self.map_size_mm/2, -self.map_size_mm/2, self.map_size_mm/2)
-        self.ax.imshow(self.global_map, cmap='gray', origin='lower', extent=extent)
-        self.ax.plot(self.pose_x, self.pose_y, 'ro', markersize=10)
-        arrow_length = 500  # mm
-        end_x = self.pose_x + arrow_length * cos(self.pose_theta)
-        end_y = self.pose_y + arrow_length * sin(self.pose_theta)
-        self.ax.plot([self.pose_x, end_x], [self.pose_y, end_y], 'r-', linewidth=2)
-        self.ax.set_title(f"Global Map - Total Distance: {self.robot_distance:.2f} mm")
+
+        # 2) Vẽ background map (static hoặc đã merge trước đó)
+        extent = (
+            -self.map_size_mm / 2, self.map_size_mm / 2,
+            -self.map_size_mm / 2, self.map_size_mm / 2
+        )
+        # vmin, vmax cố định để grayscale không bị scale lại
+        self.ax.imshow(
+            self.global_map,
+            cmap='gray',
+            origin='lower',
+            extent=extent,
+            vmin=0, vmax=255
+        )
+
+        # 3) Nếu vẫn đang mapping (chưa load map) thì merge scan mới
+        if self.mapping_enabled:
+            angles, distances = self._filter_data(self.data['angles'], self.data['distances'])
+            if angles:
+                gx, gy = self._to_global_coordinates(angles, distances)
+                fx, fy = self._remove_outliers(gx, gy)
+                dx, dy = self.voxel_downsample(fx, fy, voxel_size=self.GRID_SIZE)
+                with self.data_lock:
+                    self.data['x_coords'].extend(dx)
+                    self.data['y_coords'].extend(dy)
+                    self.data['angles'].clear()
+                    self.data['distances'].clear()
+                # Merge vào self.global_map
+                self.update_global_map(dx, dy)
+
+        # 4) Vẽ robot & heading (luôn thực hiện)
+        self.ax.plot(self.pose_x, self.pose_y, 'ro', markersize=8)
+        arrow_len = 500  # mm
+        ex = self.pose_x + arrow_len * cos(self.pose_theta)
+        ey = self.pose_y + arrow_len * sin(self.pose_theta)
+        self.ax.plot([self.pose_x, ex], [self.pose_y, ey], 'r-', linewidth=2)
+
+        # 5) Tiêu đề, lưới
+        mode = "Mapping" if self.mapping_enabled else "Localization"
+        self.ax.set_title(f"Mode: {mode} — Dist: {self.robot_distance:.1f} mm")
         self.ax.grid(True)
+
+        # 6) Vẽ lên màn hình
         self.fig.canvas.draw()
 
     def process_data(self):
         while self.running:
             if self.data_event.wait(timeout=0.1):
                 while not self.data_queue.empty():
+                    # LUÔN enqueue để _plot_map được gọi dù đã load map
                     self.plot_queue.put(True)
                     try:
                         self.data_queue.get_nowait()
@@ -730,18 +760,119 @@ class LidarData:
                              map_size_mm=self.map_size_mm)
         print(f"[LidarData] Saved map to {filename_npz}")
 
+    def localize_robot(self, num_particles=1000, max_iterations=30):
+        import numpy as np
+
+        # --- Motion update disabled (no last_reloc_pose) ---
+        delta_s = 0.0
+        delta_theta = 0.0
+        # Noise model for jitter
+        sigma_trans = 5.0  # mm
+        sigma_rot = 0.02  # rad
+
+        # --- 1) Khởi tạo particles quanh odometry hiện tại (narrow-band sampling) ---
+        x0, y0, theta0 = self.pose_x, self.pose_y, self.pose_theta
+        R_init = 1500  # mm, bán kính khởi tạo
+        particles = np.empty((num_particles, 3))
+        particles[:, 0] = np.random.normal(x0, R_init, num_particles)
+        particles[:, 1] = np.random.normal(y0, R_init, num_particles)
+        kappa = 4.0  # độ tập trung góc
+        particles[:, 2] = np.random.vonmises(theta0, kappa, num_particles)
+
+        # Khởi tạo trọng số ban đầu theo Gaussian distance
+        d2 = (particles[:, 0] - x0) ** 2 + (particles[:, 1] - y0) ** 2
+        weights = np.exp(-0.5 * (d2 / (R_init ** 2)))
+        weights += 1e-300
+        weights /= np.sum(weights)
+
+        # --- 2) Lấy subset beams để giảm tính toán ---
+        angles, distances = self._filter_data(self.data['angles'], self.data['distances'])
+        if len(angles) < 10:
+            print("Không đủ dữ liệu LIDAR để localize!")
+            return
+        idx = np.linspace(0, len(angles) - 1, num=30, dtype=int)
+        scan_beams = np.vstack((
+            np.array(distances)[idx] * np.cos(np.array(angles)[idx] + self.heading_offset),
+            np.array(distances)[idx] * np.sin(np.array(angles)[idx] + self.heading_offset)
+        )).T  # shape (30,2)
+
+        # --- 3) Vòng MCL (Particle Filter) ---
+        for _ in range(max_iterations):
+            # 3.1 Motion update (jitter only)
+            noise_t = np.random.normal(0, sigma_trans, num_particles)
+            noise_r = np.random.normal(0, sigma_rot, num_particles)
+            particles[:, 0] += noise_t * np.cos(particles[:, 2])
+            particles[:, 1] += noise_t * np.sin(particles[:, 2])
+            particles[:, 2] += noise_r
+            particles[:, 2] = np.arctan2(np.sin(particles[:, 2]), np.cos(particles[:, 2]))
+
+            # 3.2 Measurement update (vectorized likelihood-field)
+            thetas = particles[:, 2][:, None]
+            cos_t = np.cos(thetas)
+            sin_t = np.sin(thetas)
+            px = particles[:, 0][:, None]
+            py = particles[:, 1][:, None]
+
+            X = scan_beams[None, :, 0] * cos_t - scan_beams[None, :, 1] * sin_t + px
+            Y = scan_beams[None, :, 0] * sin_t + scan_beams[None, :, 1] * cos_t + py
+
+            gx = ((X + self.map_size_mm / 2) / self.GRID_SIZE).astype(int)
+            gy = ((Y + self.map_size_mm / 2) / self.GRID_SIZE).astype(int)
+            valid = (gx >= 0) & (gx < self.global_map_dim) & (gy >= 0) & (gy < self.global_map_dim)
+
+            ds = np.full(gx.shape, self.map_size_mm, dtype=float)
+            ds[valid] = self.dist_field[gy[valid], gx[valid]]
+            weights = np.exp(-0.5 * (ds / self.sigma_z) ** 2).mean(axis=1)
+
+            # 3.3 Normalize & check entropy
+            weights += 1e-300
+            weights /= weights.sum()
+            H = -np.sum(weights * np.log(weights))
+            if H < 0.5:
+                break
+
+            # 3.4 Resample + jitter
+            idxs = np.random.choice(num_particles, num_particles, p=weights)
+            particles = particles[idxs]
+            weights.fill(1.0 / num_particles)
+            particles[:, :2] += np.random.normal(0, 5, (num_particles, 2))
+            particles[:, 2] += np.random.normal(0, 0.02, num_particles)
+
+        # --- 4) Cập nhật pose cuối cùng ---
+        self.pose_x, self.pose_y, self.pose_theta = np.average(
+            particles, axis=0, weights=weights
+        )
+        self.pose_theta = np.arctan2(np.sin(self.pose_theta), np.cos(self.pose_theta))
+        self.ekf_slam.state = np.array([self.pose_x, self.pose_y, self.pose_theta])
+
+        print(f"[Localize] x={self.pose_x:.1f}, y={self.pose_y:.1f}, θ={self.pose_theta:.3f}")
+
     def load_map(self, filename_npz):
-        """
-        Nạp bản đồ đã lưu, tắt luôn cơ chế mapping
-        """
         import numpy as _np
+        import time
         data = _np.load(filename_npz)
         self.global_map = data["global_map"]
-        self.GRID_SIZE  = int(data["grid_size"])
+        self.GRID_SIZE = int(data["grid_size"])
         self.map_size_mm = float(data["map_size_mm"])
         self.global_map_dim = self.global_map.shape[0]
         self.mapping_enabled = False
+        self.pose_x = 0.0
+        self.pose_y = 0.0
+        self.pose_theta = 0.0
         print(f"[LidarData] Loaded map from {filename_npz}")
+        # ——— TÍCH HỢP LIKELIHOOD FIELD ———
+        # occupied=255 → 1, ngược lại → 0
+        occ = (self.global_map == 255).astype(np.uint8)
+        # distance transform: với mỗi ô, khoảng cách (mm) đến chướng ngại vật gần nhất
+        self.dist_field = distance_transform_edt(1 - occ) * self.GRID_SIZE
+        # Gaussian σ cho measurement model (tùy chỉnh theo sensor)
+        self.sigma_z = 100.0
+        # ——————————————————————————————
+
+        # Chờ dữ liệu LIDAR
+        print("Đang chờ dữ liệu LIDAR để localize...")
+        time.sleep(2)  # Chờ 2 giây để thu thập dữ liệu
+        self.localize_robot()
 
 
     def move(self, distance_m):

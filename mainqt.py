@@ -528,7 +528,7 @@ class LidarData:
                 continue
             while '\n' in buffer:
                 line, buffer = buffer.split('\n', 1)
-                logging.debug("Raw data received: %s", line)
+                #logging.debug("Raw data received: %s", line)
                 sensor_data = line.strip().split('\t')
                 if len(sensor_data) != 10:
                     logging.warning("Sensor data length mismatch: %s", sensor_data)
@@ -540,8 +540,8 @@ class LidarData:
                     encoder_count = int(sensor_data[7].strip())
                     encoder_count2 = int(sensor_data[8].strip())
                     gyro_z = float(sensor_data[9].strip())
-                    logging.info("Raw data: encoder_count=%d, encoder_count2=%d, gyroZ=%.2f rad/s",
-                                 encoder_count, encoder_count2, gyro_z)
+                    #logging.info("Raw data: encoder_count=%d, encoder_count2=%d, gyroZ=%.2f rad/s",
+                    #             encoder_count, encoder_count2, gyro_z)
                 except ValueError as e:
                     logging.error("Error parsing sensor data %s: %s", sensor_data, e)
                     continue
@@ -566,9 +566,9 @@ class LidarData:
                     delta_s = (delta_left + delta_right) / 2.0
                     delta_theta_enc = (delta_right - delta_left) / self.wheel_base
                     delta_theta_gyro = gyro_z * delta_t
-                    logging.info(
-                        "Odometry: delta_left=%.2f mm, delta_right=%.2f mm, delta_theta_enc=%.4f rad, delta_theta_gyro=%.4f rad",
-                        delta_left, delta_right, delta_theta_enc, delta_theta_gyro)
+                    #logging.info(
+                    #    "Odometry: delta_left=%.2f mm, delta_right=%.2f mm, delta_theta_enc=%.4f rad, delta_theta_gyro=%.4f rad",
+                    #    delta_left, delta_right, delta_theta_enc, delta_theta_gyro)
                     # Giả sử dùng trọng số hiện tại
                     delta_theta = 0.7 * delta_theta_gyro + 0.3 * delta_theta_enc
                     if not hasattr(self, 'ekf_slam'):
@@ -576,15 +576,15 @@ class LidarData:
                     motion_cov = np.diag([1e-3, 1e-3, 3e-3])
                     self.ekf_slam.predict(delta_s, delta_theta, motion_cov)
                     self.pose_x, self.pose_y, self.pose_theta = self.ekf_slam.state
-                    logging.info("Pose updated (EKF): x=%.2f mm, y=%.2f mm, theta=%.4f rad",
-                                 self.pose_x, self.pose_y, self.pose_theta)
+                    #logging.info("Pose updated (EKF): x=%.2f mm, y=%.2f mm, theta=%.4f rad",
+                    #            self.pose_x, self.pose_y, self.pose_theta)
                     self.last_encoder_left = encoder_count
                     self.last_encoder_right = encoder_count2
 
                 self.robot_distance = (((encoder_count - self.initial_encoder_left) +
                                         (encoder_count2 - self.initial_encoder_right)) / 2
                                        * self.wheel_circumference / self.ppr)
-                logging.info("Total distance traveled: %.2f mm", self.robot_distance)
+                #logging.info("Total distance traveled: %.2f mm", self.robot_distance)
 
                 # --- Xử lý dữ liệu LiDAR (Motion Distortion Correction) ---
                 n_points = 4
@@ -838,7 +838,7 @@ class LidarData:
         sigma_rot = 0.02  # rad
 
         x0, y0, theta0 = self.pose_x, self.pose_y, self.pose_theta
-        R_init = 1500
+        R_init = 1000
         particles = np.empty((num_particles, 3))
         particles[:, 0] = np.random.normal(x0, R_init, num_particles)
         particles[:, 1] = np.random.normal(y0, R_init, num_particles)

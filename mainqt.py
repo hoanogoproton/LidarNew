@@ -555,6 +555,8 @@ class LidarData:
                     self.robot_distance = 0.0
                     self.last_time = time.time()
                     logging.info("Initialized encoders: left=%d, right=%d", encoder_count, encoder_count2)
+                    continue  # ⬅️ THÊM DÒNG NÀY để bỏ qua bước cập nhật vận tốc lần đầu
+
                 else:
                     current_time = time.time()
                     delta_t = current_time - self.last_time
@@ -571,7 +573,7 @@ class LidarData:
                     delta_theta = 0.7 * delta_theta_gyro + 0.3 * delta_theta_enc
                     if not hasattr(self, 'ekf_slam'):
                         self.ekf_slam = EKFSLAM([self.pose_x, self.pose_y, self.pose_theta])
-                    motion_cov = np.diag([1e-3, 1e-3, 3e-2])
+                    motion_cov = np.diag([1e-3, 1e-3, 3e-3])
                     self.ekf_slam.predict(delta_s, delta_theta, motion_cov)
                     self.pose_x, self.pose_y, self.pose_theta = self.ekf_slam.state
                     logging.info("Pose updated (EKF): x=%.2f mm, y=%.2f mm, theta=%.4f rad",
@@ -586,13 +588,64 @@ class LidarData:
 
                 # --- Xử lý dữ liệu LiDAR (Motion Distortion Correction) ---
                 n_points = 4
-                SCAN_DURATION = 0.05
+                SCAN_DURATION = 0.01
                 dt = SCAN_DURATION / n_points
+
+                # Tính vận tốc tuyến tính và góc
+                current_time = time.time()
+                delta_t = current_time - self.last_time
+                self.last_time = current_time
+
+                # Sử dụng delta_s đã tính từ encoder
+                v = delta_s / delta_t if delta_t > 0 else 0  # Vận tốc tuyến tính (mm/s)
+                omega = gyro_z  # Vận tốc góc (rad/s)
+
+                # Pose tại thời điểm bắt đầu quét
+                x0, y0, theta0 = self.ekf_slam.state
+
+                # Thời gian tương đối cho mỗi điểm
+                t_i = np.arange(n_points) * dt
+
+                # Ước lượng pose tại mỗi thời điểm t_i
+                theta_i = theta0 + omega * t_i
+                x_i = x0 + v * t_i * np.cos(theta0 + omega * t_i / 2)
+                y_i = y0 + v * t_i * np.sin(theta0 + omega * t_i / 2)
+
+                # Góc ban đầu của các điểm
                 raw_angles = (np.arange(n_points) + base_angle) * (pi / 180)
-                corrected_angles = raw_angles - gyro_z * dt * np.arange(n_points)
-                valid_mask = (distances >= self.MIN_DISTANCE) & (distances <= self.MAX_DISTANCE)
-                valid_angles = corrected_angles[valid_mask]
-                valid_distances = distances[valid_mask]
+                distances_np = np.array(distances)  # Chuyển distances thành NumPy array nếu chưa phải
+
+                # Lọc các điểm hợp lệ
+                valid_mask = (distances_np >= self.MIN_DISTANCE) & (distances_np <= self.MAX_DISTANCE)
+                valid_angles = raw_angles[valid_mask]
+                valid_distances = distances_np[valid_mask]
+                valid_x_i = x_i[valid_mask]
+                valid_y_i = y_i[valid_mask]
+                valid_theta_i = theta_i[valid_mask]
+
+                # Tính tọa độ toàn cục cho các điểm hợp lệ
+                global_x = valid_x_i + valid_distances * np.cos(valid_theta_i + valid_angles)
+                global_y = valid_y_i + valid_distances * np.sin(valid_theta_i + valid_angles)
+
+                # Lưu dữ liệu vào self.data để xử lý tiếp
+                with self.data_lock:
+                    self.data['angles'].extend(valid_angles.tolist())
+                    self.data['distances'].extend(valid_distances.tolist())
+                    self.data['speed'].extend([speed] * len(valid_angles))
+                    self.data['x_coords'].extend(global_x.tolist())
+                    self.data['y_coords'].extend(global_y.tolist())
+
+                    # Kiểm tra kích thước dữ liệu
+                    if len(self.data['angles']) >= self.MAX_DATA_SIZE:
+                        self.data_queue.put(True)
+                        self.data_event.set()
+                    if len(self.data['angles']) > 500:
+                        sample_size = min(200, len(self.data['angles']))  # tránh out of range
+                        indices = np.random.choice(len(self.data['angles']), sample_size, replace=False)
+                        self.data['angles'] = [self.data['angles'][i] for i in indices]
+                        self.data['distances'] = [self.data['distances'][i] for i in indices]
+                        self.data['speed'] = [self.data['speed'][i] for i in indices]
+
                 # --- KẾT THÚC xử lý LiDAR ---
 
                 if valid_angles.size > 0:
@@ -603,7 +656,7 @@ class LidarData:
                         lx = self.ekf_slam.state[0] + meas_range * cos(self.ekf_slam.state[2] + meas_bearing)
                         ly = self.ekf_slam.state[1] + meas_range * sin(self.ekf_slam.state[2] + meas_bearing)
                         landmark_pos = np.array([lx, ly])
-                        measurement_cov = np.diag([1e-3, 1e-1])
+                        measurement_cov = np.diag([2e-2, 3e-2])
                         self.ekf_slam.update(z, landmark_pos, measurement_cov)
                 with self.data_lock:
                     self.data['angles'].extend(valid_angles.tolist())
@@ -762,43 +815,55 @@ class LidarData:
 
     def localize_robot(self, num_particles=1000, max_iterations=30):
         import numpy as np
+        from math import atan2, sin, cos, sqrt
 
-        # --- Motion update disabled (no last_reloc_pose) ---
-        delta_s = 0.0
-        delta_theta = 0.0
-        # Noise model for jitter
+        # --- Systematic resampling helper ---
+        def systematic_resample(weights):
+            N = len(weights)
+            positions = (np.arange(N) + np.random.rand()) / N
+            cum_sum = np.cumsum(weights)
+            return np.searchsorted(cum_sum, positions)
+
+        # --- 0) Motion update from odometry ---
+        if not hasattr(self, 'last_reloc_pose'):
+            self.last_reloc_pose = (self.pose_x, self.pose_y, self.pose_theta)
+        dx = self.pose_x - self.last_reloc_pose[0]
+        dy = self.pose_y - self.last_reloc_pose[1]
+        delta_s = sqrt(dx ** 2 + dy ** 2)
+        delta_theta = atan2(sin(self.pose_theta - self.last_reloc_pose[2]),
+                            cos(self.pose_theta - self.last_reloc_pose[2]))
+        self.last_reloc_pose = (self.pose_x, self.pose_y, self.pose_theta)
+
         sigma_trans = 5.0  # mm
         sigma_rot = 0.02  # rad
 
-        # --- 1) Khởi tạo particles quanh odometry hiện tại (narrow-band sampling) ---
         x0, y0, theta0 = self.pose_x, self.pose_y, self.pose_theta
-        R_init = 1500  # mm, bán kính khởi tạo
+        R_init = 1500
         particles = np.empty((num_particles, 3))
         particles[:, 0] = np.random.normal(x0, R_init, num_particles)
         particles[:, 1] = np.random.normal(y0, R_init, num_particles)
-        kappa = 4.0  # độ tập trung góc
-        particles[:, 2] = np.random.vonmises(theta0, kappa, num_particles)
-
-        # Khởi tạo trọng số ban đầu theo Gaussian distance
+        particles[:, 2] = np.random.vonmises(theta0, 4.0, num_particles)
         d2 = (particles[:, 0] - x0) ** 2 + (particles[:, 1] - y0) ** 2
         weights = np.exp(-0.5 * (d2 / (R_init ** 2)))
         weights += 1e-300
-        weights /= np.sum(weights)
+        weights /= weights.sum()
 
-        # --- 2) Lấy subset beams để giảm tính toán ---
         angles, distances = self._filter_data(self.data['angles'], self.data['distances'])
         if len(angles) < 10:
             print("Không đủ dữ liệu LIDAR để localize!")
             return
         idx = np.linspace(0, len(angles) - 1, num=30, dtype=int)
-        scan_beams = np.vstack((
+        beams = np.vstack((
             np.array(distances)[idx] * np.cos(np.array(angles)[idx] + self.heading_offset),
             np.array(distances)[idx] * np.sin(np.array(angles)[idx] + self.heading_offset)
-        )).T  # shape (30,2)
+        )).T
 
-        # --- 3) Vòng MCL (Particle Filter) ---
         for _ in range(max_iterations):
-            # 3.1 Motion update (jitter only)
+            particles[:, 0] += delta_s * np.cos(particles[:, 2])
+            particles[:, 1] += delta_s * np.sin(particles[:, 2])
+            particles[:, 2] += delta_theta
+            particles[:, 2] = np.arctan2(np.sin(particles[:, 2]), np.cos(particles[:, 2]))
+
             noise_t = np.random.normal(0, sigma_trans, num_particles)
             noise_r = np.random.normal(0, sigma_rot, num_particles)
             particles[:, 0] += noise_t * np.cos(particles[:, 2])
@@ -806,15 +871,13 @@ class LidarData:
             particles[:, 2] += noise_r
             particles[:, 2] = np.arctan2(np.sin(particles[:, 2]), np.cos(particles[:, 2]))
 
-            # 3.2 Measurement update (vectorized likelihood-field)
             thetas = particles[:, 2][:, None]
             cos_t = np.cos(thetas)
             sin_t = np.sin(thetas)
             px = particles[:, 0][:, None]
             py = particles[:, 1][:, None]
-
-            X = scan_beams[None, :, 0] * cos_t - scan_beams[None, :, 1] * sin_t + px
-            Y = scan_beams[None, :, 0] * sin_t + scan_beams[None, :, 1] * cos_t + py
+            X = beams[None, :, 0] * cos_t - beams[None, :, 1] * sin_t + px
+            Y = beams[None, :, 0] * sin_t + beams[None, :, 1] * cos_t + py
 
             gx = ((X + self.map_size_mm / 2) / self.GRID_SIZE).astype(int)
             gy = ((Y + self.map_size_mm / 2) / self.GRID_SIZE).astype(int)
@@ -824,32 +887,44 @@ class LidarData:
             ds[valid] = self.dist_field[gy[valid], gx[valid]]
             weights = np.exp(-0.5 * (ds / self.sigma_z) ** 2).mean(axis=1)
 
-            # 3.3 Normalize & check entropy
             weights += 1e-300
             weights /= weights.sum()
             H = -np.sum(weights * np.log(weights))
             if H < 0.5:
                 break
 
-            # 3.4 Resample + jitter
-            idxs = np.random.choice(num_particles, num_particles, p=weights)
+            idxs = systematic_resample(weights)
             particles = particles[idxs]
             weights.fill(1.0 / num_particles)
-            particles[:, :2] += np.random.normal(0, 5, (num_particles, 2))
-            particles[:, 2] += np.random.normal(0, 0.02, num_particles)
 
-        # --- 4) Cập nhật pose cuối cùng ---
-        self.pose_x, self.pose_y, self.pose_theta = np.average(
-            particles, axis=0, weights=weights
-        )
+        self.pose_x, self.pose_y, self.pose_theta = np.average(particles, axis=0, weights=weights)
         self.pose_theta = np.arctan2(np.sin(self.pose_theta), np.cos(self.pose_theta))
-        self.ekf_slam.state = np.array([self.pose_x, self.pose_y, self.pose_theta])
 
-        print(f"[Localize] x={self.pose_x:.1f}, y={self.pose_y:.1f}, θ={self.pose_theta:.3f}")
+        # --- ICP refinement ---
+        angles_full, distances_full = self._filter_data(self.data['angles'], self.data['distances'])
+        gx, gy = self._to_global_coordinates(angles_full, distances_full)
+        scan = np.vstack((gx, gy)).T
+
+        # Tạo tập điểm từ bản đồ (biên obstacle)
+        ys, xs = np.where(self.global_map == 255)
+        map_x = xs * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2
+        map_y = ys * self.GRID_SIZE - self.map_size_mm / 2 + self.GRID_SIZE / 2
+        map_points = np.vstack((map_x, map_y)).T
+
+        R_icp, t_icp = self.icp(map_points, scan)
+        dtheta = atan2(R_icp[1, 0], R_icp[0, 0])
+        self.pose_x += t_icp[0, 0]
+        self.pose_y += t_icp[1, 0]
+        self.pose_theta = atan2(sin(self.pose_theta + dtheta), cos(self.pose_theta + dtheta))
+
+        self.ekf_slam.state = np.array([self.pose_x, self.pose_y, self.pose_theta])
+        print(f"[Localize] x={self.pose_x:.1f}, y={self.pose_y:.1f}, θ={self.pose_theta:.3f} (refined with ICP)")
 
     def load_map(self, filename_npz):
         import numpy as _np
         import time
+        import threading  # thêm nếu chưa có
+
         data = _np.load(filename_npz)
         self.global_map = data["global_map"]
         self.GRID_SIZE = int(data["grid_size"])
@@ -860,20 +935,32 @@ class LidarData:
         self.pose_y = 0.0
         self.pose_theta = 0.0
         print(f"[LidarData] Loaded map from {filename_npz}")
+
         # ——— TÍCH HỢP LIKELIHOOD FIELD ———
-        # occupied=255 → 1, ngược lại → 0
-        occ = (self.global_map == 255).astype(np.uint8)
-        # distance transform: với mỗi ô, khoảng cách (mm) đến chướng ngại vật gần nhất
+        from scipy.ndimage import distance_transform_edt
+        occ = (self.global_map == 255).astype(_np.uint8)
         self.dist_field = distance_transform_edt(1 - occ) * self.GRID_SIZE
-        # Gaussian σ cho measurement model (tùy chỉnh theo sensor)
         self.sigma_z = 100.0
         # ——————————————————————————————
 
-        # Chờ dữ liệu LIDAR
-        print("Đang chờ dữ liệu LIDAR để localize...")
-        time.sleep(2)  # Chờ 2 giây để thu thập dữ liệu
-        self.localize_robot()
+        # Xóa dữ liệu lidar cũ
+        with self.data_lock:
+            self.data['angles'].clear()
+            self.data['distances'].clear()
 
+        print("Đang chờ dữ liệu LiDAR để localize...")
+
+        # Chờ đến khi có đủ tia hoặc timeout
+        timeout = 5.0  # giây
+        start_t = time.time()
+        while True:
+            angles, distances = self._filter_data(self.data['angles'], self.data['distances'])
+            if len(angles) >= 30 or (time.time() - start_t) > timeout:
+                break
+            time.sleep(0.1)
+
+        # Gọi localize_robot trong thread riêng
+        threading.Thread(target=self.localize_robot, daemon=True).start()
 
     def move(self, distance_m):
         """
